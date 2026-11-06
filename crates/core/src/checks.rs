@@ -1,4 +1,4 @@
-//! The critic slot: compile and test on the local machine, so the model
+//! Checks: compile and test on this computer, so the model
 //! never spends tokens on what a compiler can catch.
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CriticRun {
+pub struct CheckRun {
     pub command: String,
     pub passed: bool,
     pub exit_code: Option<i32>,
@@ -20,7 +20,7 @@ pub struct CriticRun {
 
 const KEEP_LINES: usize = 40;
 
-pub fn run(repo: &Path, command: &str, timeout: Duration) -> CriticRun {
+pub fn run(repo: &Path, command: &str, timeout: Duration) -> CheckRun {
     let started = Instant::now();
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -38,13 +38,13 @@ pub fn run(repo: &Path, command: &str, timeout: Duration) -> CriticRun {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return CriticRun {
+            return CheckRun {
                 command: command.into(),
                 passed: false,
                 exit_code: None,
                 timed_out: false,
                 secs: 0.0,
-                summary: format!("could not start the critic: {e}"),
+                summary: format!("could not start the checks: {e}"),
             }
         }
     };
@@ -78,7 +78,7 @@ pub fn run(repo: &Path, command: &str, timeout: Duration) -> CriticRun {
     let err = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
     let exit_code = status.and_then(|s| s.code());
     let passed = !timed_out && exit_code == Some(0);
-    CriticRun {
+    CheckRun {
         command: command.into(),
         passed,
         exit_code,

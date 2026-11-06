@@ -2,7 +2,7 @@
 //! job engine is what enforces them.
 
 use anyhow::{Context, Result};
-use ndstrl_core::{Job, Outcome, Traveler};
+use ndstrl_core::{Job, Outcome, JobSpec};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -13,7 +13,7 @@ pub fn definitions() -> Value {
         {
             "name": "job_open",
             "title": "Open the job",
-            "description": "Load the part onto the floor. Give the user's goal and limits to start a job, or just the repo to resume the traveler already in .ndstrl/job.toml. Returns allowed paths, the test command, the budget, and a rough size estimate. Call this first.",
+            "description": "Start or resume the job. Give the user's goal and limits to start one, or only the repo to resume the job in .ndstrl/job.toml (for example after a handoff). Returns the editable paths, the test command, the budget, and a size estimate. Call this first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -21,11 +21,16 @@ pub fn definitions() -> Value {
                     "goal": { "type": "string", "description": "What done means, in the user's words." },
                     "allow": { "type": "array", "items": { "type": "string" }, "description": "Globs that may be edited, e.g. [\"src/invoice\", \"tests/**\"]. Empty means the whole repo." },
                     "deny": { "type": "array", "items": { "type": "string" }, "description": "Globs that must not be edited, e.g. [\"src/billing\"]." },
-                    "test": { "type": "string", "description": "Inspection command; exit 0 means done, e.g. \"cargo test invoice\"." },
+                    "test": { "type": "string", "description": "Check command; exit code 0 means the job is done, e.g. \"cargo test invoice\"." },
                     "budget_usd": { "type": "number", "description": "Dollar cap for this run." },
-                    "budget_tokens": { "type": "integer", "description": "Token cap, for machines whose dollars cannot be read." },
+                    "budget_tokens": { "type": "integer", "description": "Token cap, for agents whose cost cannot be read." },
                     "budget_plan_5h_pct": { "type": "number", "description": "Cap in percentage points of the subscription's 5-hour window, e.g. 10." },
-                    "budget_plan_7d_pct": { "type": "number", "description": "Cap in percentage points of the subscription's weekly window, e.g. 2." }
+                    "budget_plan_7d_pct": { "type": "number", "description": "Cap in percentage points of the subscription's weekly window, e.g. 2." },
+                    "guard": { "type": "string", "description": "Broader command (usually the full test suite) that must also pass before the job is done, so a fix here cannot break things elsewhere." },
+                    "max_files": { "type": "integer", "description": "Ask before the job changes more than this many files. A small UI fix might be 3." },
+                    "max_changed_lines": { "type": "integer", "description": "Ask before the job's total changed lines pass this." },
+                    "max_minutes": { "type": "integer", "description": "Ask before the job runs longer than this." },
+                    "max_context_tokens": { "type": "integer", "description": "Hand off to a fresh session past this context size. Default 160000." }
                 },
                 "additionalProperties": false
             },
@@ -34,7 +39,7 @@ pub fn definitions() -> Value {
         {
             "name": "job_status",
             "title": "Job status",
-            "description": "The traveler, gauges, files touched, open questions, and last inspection.",
+            "description": "The job spec, budget gauges, files touched, open questions, and the last check run.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": ro
         },
@@ -80,7 +85,7 @@ pub fn definitions() -> Value {
         {
             "name": "edit",
             "title": "Apply an edit",
-            "description": "Replace an exact string in a file. old_string must be unique unless replace_all. Refused outside the job's scope (that becomes a QUESTION), after inspection passes, or at the budget cap.",
+            "description": "Replace an exact string in a file. old_string must be unique unless replace_all. Refused outside the job's scope (that becomes a QUESTION), after checks pass, or at the budget cap.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -107,16 +112,16 @@ pub fn definitions() -> Value {
             "annotations": rw
         },
         {
-            "name": "inspect",
-            "title": "Run inspection",
-            "description": "Run the job's test command on this machine and return pass/fail with a short failure excerpt. Costs no model tokens beyond the excerpt. A pass marks the part done and closes edits.",
+            "name": "run_checks",
+            "title": "Run checks",
+            "description": "Run the job's test command on this computer and return pass/fail with a short failure excerpt. Uses no model tokens beyond the excerpt. A pass marks the job done and closes edits.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         },
         {
             "name": "ask",
             "title": "Ask the user",
-            "description": "Pause and ask the user instead of guessing: picking a design, leaving the drawing, or anything expensive or irreversible.",
+            "description": "Pause and ask the user instead of guessing: picking a design, going outside the job's scope, or anything expensive or irreversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -143,7 +148,7 @@ pub fn definitions() -> Value {
         {
             "name": "receipt",
             "title": "Write the receipt",
-            "description": "Write the run's receipt (spend, files, inspections, questions, denials) to .ndstrl/receipts and return its path.",
+            "description": "Write the run's receipt (spend, files, check runs, questions, refusals) to .ndstrl/receipts and return its path.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": rw
         }
@@ -174,17 +179,17 @@ fn strings(a: &Value, k: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn open(a: &Value, machine: &str) -> Result<(Job, String)> {
+pub fn open(a: &Value, agent: &str) -> Result<(Job, String)> {
     let repo = match s(a, "repo") {
         Some(r) => PathBuf::from(r),
         None => default_repo(&std::env::current_dir()?),
     };
     let fresh = match s(a, "goal") {
         Some(goal) => {
-            // Starting a new part keeps any limits already on the traveler
+            // Starting a new part keeps any limits already on the spec
             // unless the caller overrides them.
-            let base = Traveler::load(&repo).ok().flatten().unwrap_or_default();
-            let mut t = Traveler { id: String::new(), goal: goal.to_string(), ..base };
+            let base = JobSpec::load(&repo).ok().flatten().unwrap_or_default();
+            let mut t = JobSpec { id: String::new(), goal: goal.to_string(), ..base };
             if a.get("allow").is_some() {
                 t.allow = strings(a, "allow");
             }
@@ -206,34 +211,58 @@ pub fn open(a: &Value, machine: &str) -> Result<(Job, String)> {
             if let Some(x) = a.get("budget_plan_7d_pct").and_then(|v| v.as_f64()) {
                 t.budget_plan_7d_pct = Some(x);
             }
+            if let Some(x) = s(a, "guard") {
+                t.guard = Some(x.to_string());
+            }
+            if let Some(x) = a.get("max_files").and_then(|v| v.as_u64()) {
+                t.max_files = Some(x as usize);
+            }
+            if let Some(x) = a.get("max_changed_lines").and_then(|v| v.as_u64()) {
+                t.max_changed_lines = Some(x as usize);
+            }
+            if let Some(x) = a.get("max_minutes").and_then(|v| v.as_u64()) {
+                t.max_minutes = Some(x);
+            }
+            if let Some(x) = a.get("max_context_tokens").and_then(|v| v.as_u64()) {
+                t.max_context_tokens = Some(x);
+            }
             Some(t)
         }
         None => None,
     };
-    let job = Job::open(&repo, fresh, machine).context("opening the job")?;
-    let text = describe(&job);
+    let job = Job::open(&repo, fresh, agent).context("opening the job")?;
+    let mut text = describe(&job);
+    // A fresh session picking up a handed-off job starts from the note,
+    // not from re-exploring the repo.
+    let handed_off_elsewhere = job.state.handoff.is_some() && job.state.handoff_transcript != job.state.transcript;
+    if handed_off_elsewhere {
+        if let Ok(note) = std::fs::read_to_string(job.repo.join(".ndstrl/handoff.md")) {
+            text.push_str("\n\nHANDOFF FROM THE PREVIOUS SESSION (start here):\n");
+            text.push_str(&note);
+        }
+    }
     Ok((job, text))
 }
 
 fn describe(job: &Job) -> String {
-    let t = &job.traveler;
+    let t = &job.spec;
     let (files, bytes) = size_of_scope(job);
     let est = bytes / 4;
     format!(
-        "Job {} open in {}\nGoal: {}\nMay edit: {}\nMay not edit: {}\nInspection: {}\nBudget: {}{}{}\nMeter: {}\nSize: {} editable text files, about {} tokens if read whole. Read through search and excerpts instead.\nDone already: {}",
+        "Job {} open in {}\nGoal: {}\nMay edit: {}\nMay not edit: {}\nChecks: {}\nBudget: {}{}{}\nMeter: {}\nSize: {} editable text files, about {} tokens if read whole. Read through search and excerpts instead.\nDone already: {}",
         t.id,
         job.repo.display(),
         t.goal,
         if t.allow.is_empty() { "whole repo".into() } else { t.allow.join(", ") },
         if t.deny.is_empty() { "nothing denied".into() } else { t.deny.join(", ") },
-        t.test.as_deref().unwrap_or("none set (the factory cannot say when the part is done; ask the user)"),
+        t.test.as_deref().unwrap_or("none set (NDSTRL cannot tell when the job is done; ask the user)"),
         t.budget_usd.map(|b| format!("${b:.2}")).unwrap_or_else(|| "no dollar cap".into()),
         t.budget_tokens.map(|b| format!(", {b} tokens")).unwrap_or_default(),
         [t.budget_plan_5h_pct.map(|p| format!(", {p}% of the 5h window")), t.budget_plan_7d_pct.map(|p| format!(", {p}% of the week"))]
             .into_iter()
             .flatten()
             .collect::<String>(),
-        job.state.transcript.as_deref().map(|p| format!("real usage from {p}")).unwrap_or_else(|| "factory estimate only (no transcript found)".into()),
+        job.state.transcript.as_deref().map(|p| format!("real usage from {p}")).unwrap_or_else(|| "NDSTRL estimate only (no transcript found)".into()),
         files,
         est,
         if job.state.done { "yes" } else { "no" },
@@ -268,11 +297,11 @@ pub fn dispatch(job: &mut Job, name: &str, a: &Value) -> Outcome {
             "job_status" => {
                 job.refresh();
                 let st = serde_json::to_string_pretty(&json!({
-                    "traveler": job.traveler,
+                    "spec": job.spec,
                     "touched": job.state.touched,
                     "open_questions": job.state.questions.iter().filter(|q| q.answer.is_none()).collect::<Vec<_>>(),
                     "denials": job.state.denials.len(),
-                    "last_inspection": job.state.critic_runs.last(),
+                    "last_check_run": job.state.check_runs.last(),
                     "usage": job.state.usage,
                     "factory_tokens": job.state.factory_tokens,
                 }))
@@ -289,11 +318,11 @@ pub fn dispatch(job: &mut Job, name: &str, a: &Value) -> Outcome {
                 a.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false),
             ),
             "write" => job.write(&need("path")?, &need("content")?),
-            "inspect" => job.inspect(),
+            "run_checks" | "inspect" => job.inspect(),
             "ask" => job.ask(&need("question")?, strings(a, "options")),
             "answer" => {
                 let id = a.get("question_id").and_then(|v| v.as_u64()).ok_or_else(|| Outcome::Denied("missing `question_id`".into()))?;
-                job.answer(id as u32, &need("answer")?, "machine")
+                job.answer(id as u32, &need("answer")?, "agent")
             }
             "receipt" => match job.write_receipt() {
                 Ok(p) => Outcome::Ok(format!("receipt written to {p}")),

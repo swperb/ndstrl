@@ -1,11 +1,11 @@
-//! Workholding: which paths a machine may read and which it may cut.
+//! Workholding: which paths a agent may read and which it may cut.
 
 use anyhow::{bail, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::path::{Component, Path, PathBuf};
 
-/// Paths no machine reads or edits through the factory, whatever the
-/// traveler says. Keeps credentials out of model context.
+/// Paths no agent reads or edits through NDSTRL, whatever the
+/// spec says. Keeps credentials out of model context.
 const SECRET_GLOBS: &[&str] = &[
     "**/.env",
     "**/.env.*",
@@ -22,7 +22,7 @@ pub enum Verdict {
     Allowed,
     /// Matched a deny glob or fell outside every allow glob.
     OutOfScope(String),
-    /// The factory's own files or secrets.
+    /// NDSTRL's own files or secrets.
     Forbidden(String),
 }
 
@@ -89,7 +89,7 @@ impl Scope {
             }
         }
         // Resolve symlinks on the longest existing prefix so a link inside
-        // the repo cannot point the machine outside it.
+        // the repo cannot point the agent outside it.
         let mut probe = out.clone();
         let mut tail = Vec::new();
         while !probe.exists() {
@@ -132,7 +132,7 @@ impl Scope {
             return v;
         }
         if rel == ".ndstrl" || rel.starts_with(".ndstrl/") {
-            return Verdict::Forbidden("the traveler and factory state are not editable by machines".into());
+            return Verdict::Forbidden("the job spec and NDSTRL state are not editable by agents".into());
         }
         if self.widened.iter().any(|w| w == rel) {
             return Verdict::Allowed;

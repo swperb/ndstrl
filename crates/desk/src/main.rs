@@ -1,4 +1,4 @@
-//! `ndstrl-desk [repo]`: the front office window. Watches the repo's
+//! `ndstrl-desk [repo]`: the NDSTRL window. Watches the repo's
 //! `.ndstrl` files and the plan snapshot, once a second.
 
 use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
@@ -19,7 +19,7 @@ fn main() {
         .with_window(
             WindowBuilder::new()
                 .with_title("NDSTRL")
-                .with_inner_size(LogicalSize::new(1320.0, 880.0))
+                .with_inner_size(LogicalSize::new(760.0, 620.0))
                 .with_min_inner_size(LogicalSize::new(380.0, 520.0)),
         );
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(Root);
@@ -32,7 +32,7 @@ fn Root() -> Element {
         let repo = repo.clone();
         move || model::load(&repo)
     });
-    let mut tab = use_signal(|| ui::Tab::Floor);
+    let answer_repo = repo.clone();
     use_future(move || {
         let repo = repo.clone();
         async move {
@@ -45,5 +45,21 @@ fn Root() -> Element {
             }
         }
     });
-    rsx! { ui::Page { view: view(), tab: tab(), on_tab: move |t| tab.set(t) } }
+    rsx! {
+        ui::Page {
+            view: view(),
+            on_answer: move |(id, answer): (u32, String)| {
+                // The server applies it on the agent's next step; show it now.
+                let _ = ndstrl_core::Job::post_answer(&answer_repo, id, &answer);
+                let mut v = view.peek().clone();
+                if let Some(st) = v.state.as_mut() {
+                    if let Some(q) = st.questions.iter_mut().find(|q| q.id == id) {
+                        q.answer = Some(answer.clone());
+                        q.answered_via = Some("human".into());
+                    }
+                }
+                view.set(v);
+            },
+        }
+    }
 }

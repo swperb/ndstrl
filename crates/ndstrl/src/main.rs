@@ -1,8 +1,8 @@
-//! `ndstrl`: the factory binary.
+//! `ndstrl`: the NDSTRL binary.
 //!
 //!   ndstrl                 serve MCP on stdio (what harnesses launch)
 //!   ndstrl install [claude|codex|all] [--dry-run]
-//!   ndstrl init "<goal>"   write a starter traveler in the current repo
+//!   ndstrl init "<goal>"   write a starter spec in the current repo
 //!   ndstrl status          print the open job's gauges
 
 mod bench;
@@ -40,7 +40,7 @@ fn real_main() -> Result<()> {
     }
 }
 
-const HELP: &str = "ndstrl: a software factory for coding agents
+const HELP: &str = "ndstrl: one job contract for every coding agent you use
 
 USAGE
   ndstrl                      serve MCP on stdio (harnesses launch this)
@@ -49,8 +49,8 @@ USAGE
   ndstrl init \"<goal>\"        write .ndstrl/job.toml in this repo
   ndstrl status               gauges for the job in this repo
   ndstrl statusline           Claude Code status line: logs plan usage, prints gauges
-  ndstrl bench [part..]       run parts naked vs factory on real claude -p sessions
-        --mode naked|factory|both   --model <id>";
+  ndstrl bench [job..]        run bench jobs plain vs through ndstrl on real claude -p sessions
+        --mode plain|ndstrl|both   --model <id>";
 
 fn exe() -> Result<PathBuf> {
     Ok(std::env::current_exe()?.canonicalize()?)
@@ -146,10 +146,10 @@ fn init(args: &[String]) -> Result<()> {
         bail!("usage: ndstrl init \"<goal>\"");
     }
     let repo = tools::default_repo(&std::env::current_dir()?);
-    let mut t = ndstrl_core::Traveler { goal, ..Default::default() };
+    let mut t = ndstrl_core::JobSpec { goal, ..Default::default() };
     t.test = guess_test(&repo);
     t.save(&repo)?;
-    println!("wrote {}\nEdit allow, deny, test, and budget_usd there, then send the part.", ndstrl_core::Traveler::path(&repo).display());
+    println!("wrote {}\nEdit allow, deny, test, and budget_usd there, then start a session and give it the goal.", ndstrl_core::JobSpec::path(&repo).display());
     Ok(())
 }
 
@@ -171,7 +171,7 @@ fn guess_test(repo: &Path) -> Option<String> {
 fn status() -> Result<()> {
     let repo = tools::default_repo(&std::env::current_dir()?);
     let job = ndstrl_core::Job::open(&repo, None, "cli")?;
-    println!("{}\n{}", job.traveler.goal, job.gauges().line());
+    println!("{}\n{}", job.spec.goal, job.gauges().line());
     Ok(())
 }
 
@@ -241,17 +241,17 @@ fn statusline() -> Result<()> {
         let repo = tools::default_repo(&dir);
         if let Ok(text) = std::fs::read_to_string(repo.join(".ndstrl/state.json")) {
             if let Ok(st) = serde_json::from_str::<ndstrl_core::job::State>(&text) {
-                let critic = match st.critic_runs.last() {
+                let checks = match st.check_runs.last() {
                     None => "-",
                     Some(r) if r.passed => "pass",
                     Some(_) => "fail",
                 };
                 let open_q = st.questions.iter().any(|q| q.answer.is_none());
                 parts.push(format!(
-                    "job ${:.2} · {} files · critic {}{}{}",
+                    "job ${:.2} · {} files · checks {}{}{}",
                     st.usage.usd,
                     st.touched.len(),
-                    critic,
+                    checks,
                     if st.done { " · done" } else { "" },
                     if open_q { " · QUESTION" } else { "" }
                 ));

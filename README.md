@@ -1,64 +1,60 @@
 # NDSTRL
 
-A software factory for coding agents. The part stays the same; the machines on the floor can change.
+One job contract for every coding agent you use. Stop burning a week of plan usage on one question.
 
-You send the factory a part: a goal, a repo, a scope, the tests that define done, and a budget. The factory holds that contract and enforces it from the server side, so the same job runs on Claude Code today and Codex tomorrow without rewriting skills or prompts.
+You tell your agent what you want, the limits, and a budget. NDSTRL is an MCP server that holds that job and enforces it from outside the model, so it holds whether the agent is Claude Code today or Codex tomorrow:
 
-`ndstrl` is one Rust binary that speaks MCP over stdio. No skills, no prompt packs, no new editor.
+- **Scope:** edits outside the job's paths turn into a question, never a silent change.
+- **Budget:** real spend is read from the session transcript and priced per model. Plan usage (5-hour and weekly windows) comes from Claude Code's status line at no cost. The agent is asked before it spends into the last 25%, and stopped at the cap.
+- **Context rot:** past 160k tokens of context (configurable), NDSTRL writes a handoff note and stops the session. A fresh session resumes the job from the note, spend carried over.
+- **Blast radius:** optional caps on files and changed lines, so a small fix stays small.
+- **Done means done:** checks run on your machine, not in the model. A passing run closes edits. An optional `guard` command (your full suite) must pass too, so a fix here cannot break something there.
+- **Cheap reads:** search and read return short excerpts, never whole trees. Secrets and `.git` are unreadable.
+- **Receipts:** every job writes what it cost, what it touched, and what you decided.
+
+One Rust binary. No skills, no prompt packs, no new editor.
 
 ## Install
 
 ```bash
 cargo build --release
-./target/release/ndstrl install          # Claude Code + Claude Desktop Code tab (~/.claude.json)
-./target/release/ndstrl install codex    # Codex CLI (~/.codex/config.toml)
-./target/release/ndstrl install all --dry-run
+./target/release/ndstrl install          # Claude Code (CLI and the Desktop Code tab) + status line
+./target/release/ndstrl install codex    # Codex CLI
 ```
 
-Then start a new session and say what you want, with a budget:
+Then start a session and say what you want:
 
-> Fix the failing invoice test. Don't touch billing. Stop at $4.
+> Fix the save button on the settings page. Only touch src/settings. Max 3 files. Run the full test suite before you call it done. Stop at $2.
 
-## What the factory enforces
+## The job spec
 
-| Rule | How |
+Lives at `.ndstrl/job.toml`. Commit it if you want the job to move between machines or agents.
+
+| Field | Meaning |
 | --- | --- |
-| Scope | `edit`/`write` refuse paths outside `allow` or inside `deny`. Leaving the drawing becomes a QUESTION, never a silent edit. |
-| Ask, don't guess | Questions go to the human directly over MCP elicitation when the client supports it; otherwise the model must relay them, and the receipt records which. |
-| Budget | Real spend is read from the Claude Code transcript (`CLAUDE_CODE_SESSION_ID`), priced per model. Below `ask_below` (25%) of the budget, the next step asks. At the cap, every paid tool blocks and the receipt is written. |
-| Cheap reads | `search`/`read`/`list_files` return capped excerpts, never the tree. Secrets and `.git` are unreadable. |
-| Local critic | `inspect` runs the test command on the machine and returns a short failure excerpt. |
-| Stop at green | A passing inspection marks the part done; edits are refused after that. |
-| Receipts | `.ndstrl/receipts/<job>.md` and `.json`: spend, files with +/- lines, inspections, questions, denials. |
+| `goal` | What done means, in your words |
+| `allow` / `deny` | Paths the agent may and may not edit |
+| `test` | The check command; exit 0 means done |
+| `guard` | A broader command that must also pass |
+| `budget_usd` | Cap at API prices (a usage proxy on subscription plans) |
+| `budget_plan_5h_pct` / `budget_plan_7d_pct` | Cap in points of your plan's windows |
+| `max_files` / `max_changed_lines` / `max_minutes` | Ask before the job grows past these |
+| `max_context_tokens` | Hand off to a fresh session past this (default 160000) |
 
-The traveler lives at `.ndstrl/job.toml` (commit it, the part travels). Live state and an event ledger sit beside it for the front office to watch.
+## The window
 
-## Front office
-
-`ndstrl-desk [repo]` opens a desktop window (Dioxus, 100% Rust) that watches a repo's floor live: status, the open question, list-price spend against the cap, plan window usage, tokens, inspection (marked stale when edits landed after it), the traveler, files touched, and the activity timeline. Receipts has every run. It only reads the files the factory writes and computes gauges with the same core functions as the server, so the two cannot disagree.
+`ndstrl-desk [repo]` is one screen: what the agent is doing, whether it needs your answer (answer right there), what it has cost, which files changed, and how much of your plan is left.
 
 ```bash
 cargo run --release -p ndstrl-desk -- path/to/repo
 ```
 
-UI changes are checked with `desk-snapshot`, which renders the same components to static HTML from real fixture state for screenshots at desktop and phone widths, light and dark:
-
-```bash
-cargo run -p ndstrl-desk --bin desk-snapshot -- path/to/repo target/ui/floor.html --theme dark
-```
-
 ## Bench
 
-`ndstrl bench` runs fixed parts in `bench/parts/` through real headless Claude Code sessions, once naked and once through the factory, and scores them: good (green and faithful to the codebase's meaning, or correctly stopped), tokens, list price, turns, files outside scope, and questions asked. Results land in `bench/results/`.
-
-## Layout
-
-- `crates/core`: traveler, scope, reads, critic, meter, job engine
-- `crates/ndstrl`: the binary (MCP server, CLI, status line, bench)
-- `crates/desk`: the front office (desktop app and snapshot renderer)
+`ndstrl bench` runs fixed jobs in `bench/parts/` through real headless Claude Code sessions, once plain and once through NDSTRL, and scores them: good (green and faithful to the codebase, or correctly stopped), tokens, cost, turns, files out of scope, questions asked.
 
 ## Not promised
 
-The factory cannot stop a harness from using its own built-in edit tools; it is the contract machines are told to work through. Windows gets no OS sandbox in week one: the allowlist is enforced by the factory tools. A dollar cap is only as precise as the usage the harness writes down.
+NDSTRL cannot stop an agent from using its own built-in edit tools; it is the contract the agent is told to work through. Windows gets no OS sandbox; the scope is enforced by NDSTRL's tools. Costs are only as precise as the usage the agent's harness writes down.
 
 License: Apache-2.0

@@ -2,9 +2,9 @@
 //!
 //! Two sources, reported side by side:
 //! * the harness transcript (real usage the provider billed), when the
-//!   factory can find it. Claude Code writes one JSONL per session and
+//!   NDSTRL can find it. Claude Code writes one JSONL per session and
 //!   exports `CLAUDE_CODE_SESSION_ID` to the MCP servers it spawns.
-//! * the factory meter: tokens the factory itself sent back to the model.
+//! * NDSTRL's own meter: tokens its tools sent back to the model.
 //!   Works on every harness, undercounts the model's own thinking.
 
 use serde::{Deserialize, Serialize};
@@ -72,11 +72,27 @@ pub struct Usage {
     /// Responses whose model had no price; their tokens count, dollars do not.
     pub unpriced_responses: u64,
     pub responses: u64,
+    /// Size of the agent's context on its latest response (input + cache
+    /// read + cache write). This is what grows until a session rots.
+    #[serde(default)]
+    pub last_context: u64,
 }
 
 impl Usage {
     pub fn tokens(&self) -> u64 {
         self.input + self.output + self.cache_write_5m + self.cache_write_1h + self.cache_read
+    }
+
+    /// Fold in usage from an earlier session of the same job.
+    pub fn add(&mut self, o: &Usage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_write_5m += o.cache_write_5m;
+        self.cache_write_1h += o.cache_write_1h;
+        self.cache_read += o.cache_read;
+        self.usd += o.usd;
+        self.unpriced_responses += o.unpriced_responses;
+        self.responses += o.responses;
     }
 }
 
@@ -195,6 +211,7 @@ impl TranscriptMeter {
         self.usage.cache_write_5m += w5;
         self.usage.cache_write_1h += w1;
         self.usage.responses += 1;
+        self.usage.last_context = input + read + w5 + w1;
         match price_for(model) {
             Some(p) => {
                 self.usage.usd += (input as f64 * p.input
@@ -209,7 +226,7 @@ impl TranscriptMeter {
     }
 }
 
-/// Rough token count for text the factory returns. Four bytes a token is
+/// Rough token count for text NDSTRL returns. Four bytes a token is
 /// the usual English-and-code average; good enough for a meter that is
 /// labelled as an estimate.
 pub fn estimate_tokens(text: &str) -> u64 {

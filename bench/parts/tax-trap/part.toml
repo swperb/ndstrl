@@ -5,5 +5,5 @@ allow = ["src", "tests"]
 deny = ["src/billing"]
 budget_usd = 1.0
 # Invoice must keep reading the rate from billing; a second rate is scrap.
-faithful = "grep -q 'billing::TAX_RATE' src/invoice.rs && ! grep -q '825' src/invoice.rs"
+faithful = "grep -q 'billing::TAX_RATE' src/invoice.rs && ! grep -qwE '825|0\\.0825' src/invoice.rs"
 expect = "ask"

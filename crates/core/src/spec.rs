@@ -1,8 +1,8 @@
-//! The traveler: the job contract every machine has to honor.
+//! The job spec: the contract every agent has to honor.
 //!
 //! It lives at `<repo>/.ndstrl/job.toml` so it survives the session, the
 //! harness, and the model. Nothing in here is a prompt; every field is
-//! enforced by the factory tools.
+//! enforced by NDSTRL's tools.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,19 +12,19 @@ pub const DIR: &str = ".ndstrl";
 pub const FILE: &str = "job.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Traveler {
+pub struct JobSpec {
     /// Stable id for receipts. Generated when the job is first opened.
     #[serde(default)]
     pub id: String,
     /// What done means, in the user's words.
     pub goal: String,
-    /// Globs the machine may edit. Empty means the whole repo.
+    /// Globs the agent may edit. Empty means the whole repo.
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Globs the machine may never edit, even if `allow` matches.
+    /// Globs the agent may never edit, even if `allow` matches.
     #[serde(default)]
     pub deny: Vec<String>,
-    /// The inspection command. Exit code 0 means the part passes.
+    /// The check command. Exit code 0 means the job is done.
     #[serde(default)]
     pub test: Option<String>,
     /// Cap in API list-price dollars: real transcript tokens priced at
@@ -40,26 +40,48 @@ pub struct Traveler {
     /// Cap in percentage points of the plan's weekly window this job may use.
     #[serde(default)]
     pub budget_plan_7d_pct: Option<f64>,
-    /// Whether the critic may use the network. Recorded, and enforced
+    /// Hand off to a fresh session once the agent's context passes this
+    /// many tokens. Long sessions drift; a clean restart with a handoff
+    /// note is cheaper than a confused agent.
+    #[serde(default = "default_max_context")]
+    pub max_context_tokens: Option<u64>,
+    /// Ask before the job touches more than this many files.
+    #[serde(default)]
+    pub max_files: Option<usize>,
+    /// Ask before the job's total changed lines pass this.
+    #[serde(default)]
+    pub max_changed_lines: Option<usize>,
+    /// Ask before the job runs longer than this many minutes.
+    #[serde(default)]
+    pub max_minutes: Option<u64>,
+    /// A broader command (usually the full test suite) that must also pass
+    /// before the job counts as done, so a fix here cannot break things there.
+    #[serde(default)]
+    pub guard: Option<String>,
+    /// Whether checks may use the network. Recorded, and enforced
     /// where the platform allows it.
     #[serde(default)]
     pub network: bool,
     /// Ask before a step once less than this fraction of the budget is left.
     #[serde(default = "default_ask_below")]
     pub ask_below: f64,
-    /// Seconds before the critic is killed.
-    #[serde(default = "default_critic_timeout")]
-    pub critic_timeout_secs: u64,
+    /// Seconds before a check run is killed.
+    #[serde(default = "default_check_timeout")]
+    #[serde(alias = "critic_timeout_secs")]
+    pub check_timeout_secs: u64,
 }
 
+fn default_max_context() -> Option<u64> {
+    Some(160_000)
+}
 fn default_ask_below() -> f64 {
     0.25
 }
-fn default_critic_timeout() -> u64 {
+fn default_check_timeout() -> u64 {
     600
 }
 
-impl Default for Traveler {
+impl Default for JobSpec {
     fn default() -> Self {
         Self {
             id: String::new(),
@@ -71,14 +93,19 @@ impl Default for Traveler {
             budget_tokens: None,
             budget_plan_5h_pct: None,
             budget_plan_7d_pct: None,
+            max_context_tokens: default_max_context(),
+            max_files: None,
+            max_changed_lines: None,
+            max_minutes: None,
+            guard: None,
             network: false,
             ask_below: default_ask_below(),
-            critic_timeout_secs: default_critic_timeout(),
+            check_timeout_secs: default_check_timeout(),
         }
     }
 }
 
-impl Traveler {
+impl JobSpec {
     pub fn path(repo: &Path) -> PathBuf {
         repo.join(DIR).join(FILE)
     }
@@ -89,7 +116,7 @@ impl Traveler {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        let t: Traveler = toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
+        let t: JobSpec = toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
         t.validate()?;
         Ok(Some(t))
     }
@@ -100,7 +127,7 @@ impl Traveler {
         std::fs::create_dir_all(&dir)?;
         ensure_gitignore(&dir)?;
         let text = format!(
-            "# NDSTRL traveler. The factory enforces this; the model cannot edit it.\n{}",
+            "# NDSTRL job spec. NDSTRL enforces this; agents cannot edit it.\n{}",
             toml::to_string_pretty(self)?
         );
         std::fs::write(Self::path(repo), text)?;
@@ -109,7 +136,7 @@ impl Traveler {
 
     pub fn validate(&self) -> Result<()> {
         if self.goal.trim().is_empty() {
-            bail!("the traveler needs a goal");
+            bail!("the spec needs a goal");
         }
         if let Some(b) = self.budget_usd {
             if !(b > 0.0) {
@@ -137,12 +164,12 @@ impl Traveler {
     }
 }
 
-/// Runtime files (state, ledger, receipts) stay out of git; the traveler
-/// itself is meant to be committed so the part travels.
+/// Runtime files (state, ledger, receipts) stay out of git; the spec
+/// itself is meant to be committed so the job can move between agents.
 fn ensure_gitignore(dir: &Path) -> Result<()> {
     let gi = dir.join(".gitignore");
     if !gi.exists() {
-        std::fs::write(gi, "state.json\nledger.jsonl\n")?;
+        std::fs::write(gi, "state.json\nledger.jsonl\ninbox.jsonl\n")?;
     }
     Ok(())
 }

@@ -1,10 +1,10 @@
-//! `ndstrl bench`: run the same part on a naked machine and through the
-//! factory, with real headless Claude Code sessions, and score both.
+//! `ndstrl bench`: run the same job on a plain agent and through NDSTRL,
+//! with real headless Claude Code sessions, and score both.
 //!
-//! This is how NDSTRL measures itself. Every change to the factory can be
+//! This is how NDSTRL measures itself. Every change to NDSTRL can be
 //! benched against fixed parts on real usage, so "better" is a number:
 //! accepted, tokens, list-price equivalent, turns, files outside the
-//! drawing, questions asked, and how close the factory meter came to what
+//! scope, questions asked, and how close the NDSTRL meter came to what
 //! the harness reported.
 
 use anyhow::{bail, Context, Result};
@@ -23,7 +23,7 @@ struct Part {
     #[serde(default)]
     deny: Vec<String>,
     budget_usd: f64,
-    /// Hidden check run after the machine finishes: does the change keep
+    /// Hidden check run after the agent finishes: does the change keep
     /// the meaning of the codebase, not just turn tests green?
     #[serde(default)]
     faithful: Option<String>,
@@ -37,11 +37,11 @@ struct Score {
     part: String,
     mode: String,
     accepted: bool,
-    /// Green and faithful, or correctly stopped when the part says to ask.
+    /// Green and faithful, or correctly stopped when the job says to ask.
     good: bool,
     tokens: u64,
     list_usd: f64,
-    factory_meter_usd: Option<f64>,
+    ndstrl_meter_usd: Option<f64>,
     turns: u64,
     secs: f64,
     files: Vec<String>,
@@ -53,18 +53,18 @@ struct Score {
 
 pub fn run(args: &[String]) -> Result<()> {
     let root = find_bench_root()?;
-    let mut modes = vec!["naked", "factory"];
+    let mut modes = vec!["plain", "ndstrl"];
     let mut model: Option<String> = None;
     let mut names = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--mode" => {
-                let m = it.next().context("--mode needs naked|factory|both")?;
+                let m = it.next().context("--mode needs plain|ndstrl|both")?;
                 modes = match m.as_str() {
-                    "naked" => vec!["naked"],
-                    "factory" => vec!["factory"],
-                    "both" => vec!["naked", "factory"],
+                    "plain" => vec!["plain"],
+                    "ndstrl" => vec!["ndstrl"],
+                    "both" => vec!["plain", "ndstrl"],
                     other => bail!("unknown mode {other}"),
                 };
             }
@@ -143,7 +143,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// A harness launched from inside another harness must not inherit the
-/// parent's session identity, or the factory would meter the wrong transcript.
+/// parent's session identity, or NDSTRL would meter the wrong transcript.
 fn scrub(cmd: &mut Command) {
     for (k, _) in std::env::vars() {
         if k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_") || k == "CLAUDE_PID" || k == "CLAUDE_EFFORT" {
@@ -160,7 +160,7 @@ fn run_one(name: &str, src: &Path, part: &Part, mode: &str, exe: &Path, model: O
     git(&work, &["add", "-A"])?;
     git(&work, &["commit", "-qm", "part"])?;
 
-    let mcp = if mode == "factory" {
+    let mcp = if mode == "ndstrl" {
         serde_json::json!({ "mcpServers": { "ndstrl": { "type": "stdio", "command": exe.display().to_string(), "args": [] } } })
     } else {
         serde_json::json!({ "mcpServers": {} })
@@ -174,9 +174,9 @@ fn run_one(name: &str, src: &Path, part: &Part, mode: &str, exe: &Path, model: O
         .arg(&part.prompt)
         .args(["--output-format", "json", "--strict-mcp-config", "--mcp-config"])
         .arg(&mcp_path)
-        // Hard stop for the bench itself, independent of the factory.
+        // Hard stop for the bench itself, independent of NDSTRL.
         .args(["--max-budget-usd", &format!("{}", part.budget_usd * 2.0)]);
-    if mode == "factory" {
+    if mode == "ndstrl" {
         cmd.args(["--allowedTools", "mcp__ndstrl__*"])
             .args(["--disallowedTools", "Edit,Write,MultiEdit,NotebookEdit,Bash,Read,Grep,Glob"]);
     } else {
@@ -189,7 +189,7 @@ fn run_one(name: &str, src: &Path, part: &Part, mode: &str, exe: &Path, model: O
     let out = cmd.output().context("running claude; is Claude Code installed?")?;
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
 
-    // Inspect independently of what the machine claims.
+    // Inspect independently of what the agent claims.
     let accepted = Command::new("sh")
         .args(["-c", &part.test])
         .current_dir(&work)
@@ -213,7 +213,7 @@ fn run_one(name: &str, src: &Path, part: &Part, mode: &str, exe: &Path, model: O
 
     let state: Option<Value> = std::fs::read_to_string(work.join(".ndstrl/state.json")).ok().and_then(|s| serde_json::from_str(&s).ok());
     let questions = state.as_ref().and_then(|s| s["questions"].as_array().map(|a| a.len() as u64)).unwrap_or(0);
-    let factory_meter_usd = state.as_ref().and_then(|s| s["usage"]["usd"].as_f64());
+    let ndstrl_meter_usd = state.as_ref().and_then(|s| s["usage"]["usd"].as_f64());
 
     let u = &v["usage"];
     let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -228,7 +228,7 @@ fn run_one(name: &str, src: &Path, part: &Part, mode: &str, exe: &Path, model: O
     };
     let _ = std::fs::write(work.join(".bench-result.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
     let good = match part.expect.as_deref() {
-        // Stopping without leaving the drawing, or finishing faithfully, both count.
+        // Stopping without going out of scope, or finishing faithfully, both count.
         Some("ask") => outside_scope.is_empty() && (faithful.unwrap_or(true) && (accepted || files.is_empty())),
         _ => accepted && faithful.unwrap_or(true) && outside_scope.is_empty(),
     };
@@ -239,7 +239,7 @@ fn run_one(name: &str, src: &Path, part: &Part, mode: &str, exe: &Path, model: O
         good,
         tokens,
         list_usd: v["total_cost_usd"].as_f64().unwrap_or(0.0),
-        factory_meter_usd,
+        ndstrl_meter_usd,
         turns: v["num_turns"].as_u64().unwrap_or(0),
         secs: v["duration_ms"].as_f64().unwrap_or(0.0) / 1000.0,
         files,
@@ -257,7 +257,7 @@ fn write_report(root: &Path, scores: &[Score], model: Option<&str>) -> Result<Pa
     let mut md = String::new();
     let _ = writeln!(md, "# Bench {stamp}\n");
     let _ = writeln!(md, "Model: {}. Dollars are API list-price equivalents of real tokens, not a bill.\n", model.unwrap_or("harness default"));
-    let _ = writeln!(md, "| part | machine | good | green | tokens | list $ | factory meter $ | turns | secs | files | outside scope | questions |");
+    let _ = writeln!(md, "| job | agent | good | green | tokens | list $ | ndstrl meter $ | turns | secs | files | outside scope | questions |");
     let _ = writeln!(md, "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: |");
     for s in scores {
         let _ = writeln!(
@@ -269,7 +269,7 @@ fn write_report(root: &Path, scores: &[Score], model: Option<&str>) -> Result<Pa
             if s.accepted { "yes" } else { "no" },
             s.tokens,
             s.list_usd,
-            s.factory_meter_usd.map(|x| format!("{x:.3}")).unwrap_or_else(|| "-".into()),
+            s.ndstrl_meter_usd.map(|x| format!("{x:.3}")).unwrap_or_else(|| "-".into()),
             s.turns,
             s.secs,
             if s.files.is_empty() { "-".into() } else { s.files.join(", ") },
@@ -277,7 +277,7 @@ fn write_report(root: &Path, scores: &[Score], model: Option<&str>) -> Result<Pa
             s.questions
         );
     }
-    let _ = writeln!(md, "\n## What each machine said\n");
+    let _ = writeln!(md, "\n## What each agent said\n");
     for s in scores {
         let _ = writeln!(md, "**{} / {}**{}\n\n> {}\n", s.part, s.mode, s.error.as_ref().map(|e| format!(" (error: {e})")).unwrap_or_default(), s.summary.replace('\n', "\n> "));
     }

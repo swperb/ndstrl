@@ -1,4 +1,4 @@
-//! Factory-owned reads: the machine sees tight excerpts, never the tree.
+//! Reads served by NDSTRL: the agent sees tight excerpts, never the tree.
 
 use crate::scope::{Scope, Verdict};
 use anyhow::{bail, Result};

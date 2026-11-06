@@ -5,7 +5,7 @@
 //! stdin (Pro/Max/Ultra, after the first response of a session), derived
 //! from response headers it already receives. `ndstrl statusline` records
 //! those snapshots under `~/.ndstrl/`. Limits are account-wide, so any
-//! session refreshes them; between refreshes the factory projects forward
+//! session refreshes them; between refreshes NDSTRL projects forward
 //! using a learned "plan percent per list-price dollar" rate.
 
 use serde::{Deserialize, Serialize};

@@ -1,4 +1,4 @@
-//! MCP over stdio: how every machine on the floor talks to the factory.
+//! MCP over stdio: how every agent talks to NDSTRL.
 //!
 //! Hand-rolled JSON-RPC 2.0, newline delimited, so the binary has no async
 //! runtime and no SDK churn. Implements initialize, ping, tools/list,
@@ -13,11 +13,11 @@ use std::sync::mpsc::{channel, Receiver};
 
 const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub const INSTRUCTIONS: &str = "NDSTRL is a software factory. It holds the job (goal, allowed paths, tests, budget) and enforces it, whatever harness you are. Open the job with `job_open` first. Then do the work only through these tools: `search`, `read` and `list_files` for code (they return tight excerpts, so do not dump files), `edit` and `write` for changes, `inspect` to run the tests locally instead of reasoning about them. Every result ends with a gauge line: budget, files touched, critic status, done. If the goal can only be met by leaving the drawing (a denied path, a design choice, a second source of truth), call `ask` instead of working around it. If a result is a QUESTION, stop and put it to the user; never answer it yourself. When `inspect` passes the part is done: call `receipt`, report, and stop. Do not polish after green.";
+pub const INSTRUCTIONS: &str = "NDSTRL holds the job (goal, editable paths, test command, budget) and enforces it, whichever agent you are. Call `job_open` first. Then work only through these tools: `search`, `read` and `list_files` to look at code (they return short excerpts, so do not dump whole files), `edit` and `write` to change it, and `run_checks` to run the tests on this computer instead of reasoning about them. Every result ends with a status line: budget, files touched, checks, done. If the goal can only be met by going outside the job's scope (a refused path, a design choice, a second source of truth), call `ask` instead of working around it. If a result is a QUESTION, stop and put it to the user; never answer it yourself. When `run_checks` passes, the job is done: call `receipt`, report, and stop. Do not polish after the tests pass.";
 
 pub struct Server {
     job: Option<Job>,
-    machine: String,
+    agent: String,
     elicitation: bool,
     next_id: u64,
     inbox: Receiver<Value>,
@@ -47,7 +47,7 @@ impl Server {
         });
         let mut s = Server {
             job: None,
-            machine: "unknown".into(),
+            agent: "unknown".into(),
             elicitation: false,
             next_id: 1,
             inbox: rx,
@@ -97,13 +97,13 @@ impl Server {
                 if let Some(ci) = params.get("clientInfo") {
                     let name = ci.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                     let ver = ci.get("version").and_then(|v| v.as_str()).unwrap_or("");
-                    self.machine = format!("{name} {ver}").trim().to_string();
+                    self.agent = format!("{name} {ver}").trim().to_string();
                 }
                 self.elicitation = params.pointer("/capabilities/elicitation").is_some();
                 let result = json!({
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "ndstrl", "title": "NDSTRL factory", "version": env!("CARGO_PKG_VERSION") },
+                    "serverInfo": { "name": "ndstrl", "title": "NDSTRL", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": INSTRUCTIONS,
                 });
                 self.reply(id, result);
@@ -122,7 +122,7 @@ impl Server {
 
     fn call(&mut self, name: &str, args: &Value) -> Value {
         if name == "job_open" {
-            return match tools::open(args, &self.machine) {
+            return match tools::open(args, &self.agent) {
                 Ok((job, text)) => {
                     let g = job.gauges();
                     self.job = Some(job);
@@ -132,10 +132,10 @@ impl Server {
             };
         }
         if self.job.is_none() {
-            // Resume a traveler already sitting in the working directory.
+            // Resume a spec already sitting in the working directory.
             if let Ok(cwd) = std::env::current_dir() {
-                if ndstrl_core::Traveler::path(&tools::default_repo(&cwd)).exists() {
-                    if let Ok(j) = Job::open(&tools::default_repo(&cwd), None, &self.machine) {
+                if ndstrl_core::JobSpec::path(&tools::default_repo(&cwd)).exists() {
+                    if let Ok(j) = Job::open(&tools::default_repo(&cwd), None, &self.agent) {
                         self.job = Some(j);
                     }
                 }
@@ -150,11 +150,11 @@ impl Server {
         let outcome = tools::dispatch(job, name, args);
         let outcome = match outcome {
             Outcome::Ask(q) if self.elicitation => {
-                let from_machine = matches!(q.kind, ndstrl_core::job::QuestionKind::Machine);
+                let from_agent = matches!(q.kind, ndstrl_core::job::QuestionKind::Agent);
                 let (o, approved) = self.elicit(q);
-                if approved && !from_machine {
+                if approved && !from_agent {
                     // The human cleared the gate; run the held step now
-                    // instead of making the machine call again.
+                    // instead of making the agent call again.
                     let job = self.job.as_mut().expect("job open");
                     let pre = match &o {
                         Outcome::Ok(t) => t.clone(),
@@ -207,7 +207,7 @@ impl Server {
                     .to_string();
                 let yes = q.options.first().map(|f| f == &choice).unwrap_or(false);
                 let o = match job.answer(q.id, &choice, "human") {
-                    Outcome::Ok(t) => Outcome::Ok(format!("The factory asked the user directly. They chose \"{choice}\". {t}")),
+                    Outcome::Ok(t) => Outcome::Ok(format!("NDSTRL asked the user directly. They chose \"{choice}\". {t}")),
                     o => o,
                 };
                 (o, yes)
