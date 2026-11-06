@@ -8,11 +8,13 @@
 //! * [`plan`] subscription window usage from the status line
 //! * [`job`] the engine that enforces all of it
 
+pub mod auto;
 pub mod checks;
 pub mod job;
 pub mod meter;
 pub mod plan;
 pub mod reads;
+pub mod route;
 pub mod scope;
 pub mod spec;
 

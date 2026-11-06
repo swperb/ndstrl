@@ -13,7 +13,7 @@ pub fn definitions() -> Value {
         {
             "name": "job_open",
             "title": "Open the job",
-            "description": "Start or resume the job. Give the user's goal and limits to start one, or only the repo to resume the job in .ndstrl/job.toml (for example after a handoff). Returns the editable paths, the test command, the budget, and a size estimate. Call this first.",
+            "description": "Start or resume the job. Give only the user's goal to have NDSTRL draft the scope, checks, and a cost estimate for the user to approve (auto mode); give the goal and limits to start one directly; or only the repo to resume the job in .ndstrl/job.toml (for example after a handoff). Returns the editable paths, the test command, the budget, and a size estimate. Call this first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -30,7 +30,10 @@ pub fn definitions() -> Value {
                     "max_files": { "type": "integer", "description": "Ask before the job changes more than this many files. A small UI fix might be 3." },
                     "max_changed_lines": { "type": "integer", "description": "Ask before the job's total changed lines pass this." },
                     "max_minutes": { "type": "integer", "description": "Ask before the job runs longer than this." },
-                    "max_context_tokens": { "type": "integer", "description": "Hand off to a fresh session past this context size. Default 160000." }
+                    "max_context_tokens": { "type": "integer", "description": "Hand off to a fresh session past this context size. Default 160000." },
+                    "tools": { "type": "array", "items": { "type": "string", "enum": ["web"] }, "description": "Extra tools allowed for this job. \"web\" lets helpers read docs online." },
+                    "allow_frontier": { "type": "boolean", "description": "Allow the frontier model (Fable) for hard problems. Only if the user asked for it." },
+                    "auto": { "type": "boolean", "description": "Draft the scope, checks, route, and a cost range from the goal, and ask the user to approve before work starts. The default when only a goal is given." }
                 },
                 "additionalProperties": false
             },
@@ -119,6 +122,21 @@ pub fn definitions() -> Value {
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         },
         {
+            "name": "delegate",
+            "title": "Hand work to a helper",
+            "description": "Send one piece of work to a helper agent on a cheaper model (or a stronger one for hard problems), so it does not fill your context or burn the expensive plan. NDSTRL picks the subscription and model. kind: lookup (find and summarize code, read-only), research (web docs, read-only, needs web allowed), edit (apply a change you already decided; give exact instructions), hard (debugging or design that needs a strong model). Returns a short summary. Helper edits are checked with git; anything outside the job's scope is put back.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "What the helper should do, specific enough to finish without asking." },
+                    "kind": { "type": "string", "enum": ["lookup", "research", "edit", "hard"] }
+                },
+                "required": ["task", "kind"],
+                "additionalProperties": false
+            },
+            "annotations": rw
+        },
+        {
             "name": "ask",
             "title": "Ask the user",
             "description": "Pause and ask the user instead of guessing: picking a design, going outside the job's scope, or anything expensive or irreversible.",
@@ -179,11 +197,23 @@ fn strings(a: &Value, k: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn open(a: &Value, agent: &str) -> Result<(Job, String)> {
+pub fn open(a: &Value, agent: &str) -> Result<(Job, Outcome)> {
     let repo = match s(a, "repo") {
         Some(r) => PathBuf::from(r),
         None => default_repo(&std::env::current_dir()?),
     };
+    // Auto mode: a goal with no limits gets a drafted job to approve.
+    const LIMITS: &[&str] = &["allow", "deny", "test", "budget_usd", "budget_tokens", "budget_plan_5h_pct", "budget_plan_7d_pct", "max_files", "max_changed_lines"];
+    let auto = a
+        .get("auto")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| s(a, "goal").is_some() && !LIMITS.iter().any(|k| a.get(*k).is_some()));
+    if auto {
+        if let Some(goal) = s(a, "goal") {
+            let (job, q) = Job::open_auto(&repo, goal, agent).context("drafting the job")?;
+            return Ok((job, Outcome::Ask(q)));
+        }
+    }
     let fresh = match s(a, "goal") {
         Some(goal) => {
             // Starting a new part keeps any limits already on the spec
@@ -226,6 +256,12 @@ pub fn open(a: &Value, agent: &str) -> Result<(Job, String)> {
             if let Some(x) = a.get("max_context_tokens").and_then(|v| v.as_u64()) {
                 t.max_context_tokens = Some(x);
             }
+            if a.get("tools").is_some() {
+                t.tools = strings(a, "tools");
+            }
+            if let Some(x) = a.get("allow_frontier").and_then(|v| v.as_bool()) {
+                t.allow_frontier = x;
+            }
             Some(t)
         }
         None => None,
@@ -241,10 +277,10 @@ pub fn open(a: &Value, agent: &str) -> Result<(Job, String)> {
             text.push_str(&note);
         }
     }
-    Ok((job, text))
+    Ok((job, Outcome::Ok(text)))
 }
 
-fn describe(job: &Job) -> String {
+pub fn describe(job: &Job) -> String {
     let t = &job.spec;
     let (files, bytes) = size_of_scope(job);
     let est = bytes / 4;
@@ -320,6 +356,7 @@ pub fn dispatch(job: &mut Job, name: &str, a: &Value) -> Outcome {
             "write" => job.write(&need("path")?, &need("content")?),
             "run_checks" | "inspect" => job.inspect(),
             "ask" => job.ask(&need("question")?, strings(a, "options")),
+            "delegate" => job.delegate(&need("task")?, &need("kind")?),
             "answer" => {
                 let id = a.get("question_id").and_then(|v| v.as_u64()).ok_or_else(|| Outcome::Denied("missing `question_id`".into()))?;
                 job.answer(id as u32, &need("answer")?, "agent")

@@ -34,6 +34,10 @@ pub enum QuestionKind {
     Size { what: String },
     /// The job has run past its time cap.
     Time { minutes: u64 },
+    /// The agent wants a tool the job does not allow yet (for example web).
+    Tool { name: String },
+    /// Auto mode drafted the job; nothing runs until the person approves.
+    Proposal { widen: Vec<crate::auto::Widen> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -105,6 +109,27 @@ pub struct State {
     /// Minutes of runtime a human approved past the time cap.
     #[serde(default)]
     pub minutes_allowance: u64,
+    /// Tools a human allowed during the job.
+    #[serde(default)]
+    pub widened_tools: Vec<String>,
+    /// What helpers on other models cost, and what they did.
+    #[serde(default)]
+    pub delegated: Usage,
+    #[serde(default)]
+    pub helper_runs: Vec<HelperRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HelperRecord {
+    pub at: String,
+    pub kind: String,
+    pub agent: String,
+    pub model: String,
+    pub usd: Option<f64>,
+    pub secs: f64,
+    pub ok: bool,
+    pub changed: Vec<String>,
+    pub reverted: Vec<String>,
 }
 
 /// What a tool hands back. Every variant is reported with the gauges.
@@ -391,6 +416,16 @@ impl Job {
         q
     }
 
+    /// Auto mode: draft the job from the goal and ask the person to approve
+    /// it. Reads work while the question is open; edits do not.
+    pub fn open_auto(repo: &Path, goal: &str, agent: &str) -> Result<(Self, Question)> {
+        let repo = repo.canonicalize()?;
+        let p = crate::auto::propose(&repo, goal);
+        let mut job = Job::open(&repo, Some(p.spec.clone()), agent)?;
+        let q = job.ask_inner(QuestionKind::Proposal { widen: p.widen.clone() }, p.summary(), p.options());
+        Ok((job, q))
+    }
+
     /// The agent asks the user something. Always allowed, never paid.
     pub fn ask(&mut self, text: &str, options: Vec<String>) -> Outcome {
         Outcome::Ask(self.ask_inner(QuestionKind::Agent, text.to_string(), options))
@@ -439,6 +474,41 @@ impl Job {
                 self.state.minutes_allowance += self.spec.max_minutes.unwrap_or(30).max(1);
                 "Approved to keep going. You will be asked again later.".into()
             }
+            QuestionKind::Proposal { widen } => {
+                let a = answer.trim().to_ascii_lowercase();
+                if a.starts_with("cancel") || a.starts_with("no") || a.starts_with("stop") {
+                    self.state.capped = true;
+                    "The user cancelled the job. Stop and report.".to_string()
+                } else {
+                    let mut applied = Vec::new();
+                    for w in widen.iter().filter(|w| a.contains(&w.option.to_ascii_lowercase()) || w.option.to_ascii_lowercase().contains(&a)) {
+                        match &w.apply {
+                            crate::auto::Apply::Web => self.state.widened_tools.push("web".into()),
+                            crate::auto::Apply::Paths(dirs) => {
+                                self.spec.allow.extend(dirs.iter().cloned());
+                                self.spec.max_files = self.spec.max_files.map(|m| m * 2);
+                                let _ = self.spec.save(&self.repo);
+                                let _ = self.rescope();
+                            }
+                            crate::auto::Apply::Frontier => {
+                                self.spec.allow_frontier = true;
+                                let _ = self.spec.save(&self.repo);
+                            }
+                        }
+                        applied.push(w.option.clone());
+                    }
+                    if applied.is_empty() {
+                        "Approved as drafted. Go ahead.".to_string()
+                    } else {
+                        format!("Approved with: {}. Go ahead.", applied.join(", "))
+                    }
+                }
+            }
+            QuestionKind::Tool { name } if yes => {
+                self.state.widened_tools.push(name.clone());
+                format!("{name} is now allowed for this job.")
+            }
+            QuestionKind::Tool { name } => format!("{name} stays off for this job. Work with what the repo has."),
             QuestionKind::Size { .. } | QuestionKind::Time { .. } => {
                 self.state.capped = true;
                 let r = self.write_receipt().unwrap_or_default();
@@ -751,6 +821,14 @@ impl Job {
         }
         let path = dir.join(format!("{}.md", t.id));
         std::fs::write(&path, md)?;
+        if s.receipt.is_none() && (s.done || s.capped) {
+            crate::auto::record_history(&crate::auto::HistoryRow {
+                files: s.touched.len(),
+                lines: s.touched.values().map(|x| x.added + x.removed).sum(),
+                usd: g.spent_usd.unwrap_or(s.delegated.usd),
+                done: s.done,
+            });
+        }
         std::fs::write(
             dir.join(format!("{}.json", t.id)),
             serde_json::to_string_pretty(&serde_json::json!({ "spec": t, "state": s, "gauges": g }))?,
@@ -760,6 +838,109 @@ impl Job {
         self.log("receipt", serde_json::json!({ "path": shown }));
         self.persist();
         Ok(shown)
+    }
+
+    // ---- helpers on other models ------------------------------------------
+
+    pub fn tool_allowed(&self, name: &str) -> bool {
+        self.spec.tools.iter().any(|t| t == name) || self.state.widened_tools.iter().any(|t| t == name)
+    }
+
+    /// Hand a piece of work to a cheaper (or stronger) agent. The helper's
+    /// cost counts against this job's budget; its edits are checked with git
+    /// and anything outside the job's scope is put back.
+    pub fn delegate(&mut self, task: &str, kind: &str) -> Outcome {
+        let Some(kind) = crate::route::Kind::parse(kind) else {
+            return Outcome::Denied("kind must be lookup, research, edit, or hard".into());
+        };
+        if let Some(b) = self.gate("delegate") {
+            return b;
+        }
+        if kind.edits() && self.state.done {
+            return Outcome::Blocked("checks already pass, so the job is done. No more edits. Call `receipt` and report.".into());
+        }
+        if kind == crate::route::Kind::Research && !self.tool_allowed("web") {
+            let q = self.ask_inner(
+                QuestionKind::Tool { name: "web".into() },
+                format!("The agent wants to look this up on the web: \"{task}\". Allow web access for this job?"),
+                vec!["Allow web".into(), "Keep it offline".into()],
+            );
+            return Outcome::Ask(q);
+        }
+        let g = self.gauges();
+        let route = match crate::route::choose(kind, self.spec.allow_frontier, &crate::route::pressures(), g.remaining_usd) {
+            Ok(r) => r,
+            Err(e) => return Outcome::Denied(e),
+        };
+        let snap = if kind.edits() {
+            match git::Snapshot::take(&self.repo) {
+                Some(s) => Some(s),
+                None => return Outcome::Denied("helpers may only edit inside a git repo, so NDSTRL can check and undo their changes. Do the edit yourself with `edit`.".into()),
+            }
+        } else {
+            None
+        };
+        let mut allow = self.spec.allow.clone();
+        allow.extend(self.state.widened.iter().cloned());
+        let prompt = crate::route::brief(kind, &self.spec.goal, task, &allow, &self.spec.deny);
+        self.log("delegate_start", serde_json::json!({ "kind": kind, "agent": route.provider, "model": route.model, "task": task }));
+        self.persist();
+        let run = match route.provider {
+            crate::route::Provider::Claude => crate::route::run_claude(&self.repo, &route, kind, &prompt),
+            _ => crate::route::run_other(&route),
+        };
+        self.state.delegated.add(&run.usage);
+
+        let (mut changed, mut reverted) = (Vec::new(), Vec::new());
+        if let Some(snap) = snap {
+            for c in snap.changes(&self.repo) {
+                if c.path.starts_with(".ndstrl/") {
+                    continue;
+                }
+                let verdict = self.scope.can_edit(&c.path);
+                if verdict == Verdict::Allowed {
+                    let before = c.before.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
+                    let after = c.after.as_deref().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+                    self.record_touch(&c.path, before.as_deref(), &after);
+                    changed.push(c.path.clone());
+                } else {
+                    c.restore(&self.repo);
+                    self.deny("delegate", &c.path, "a helper changed it outside the job's scope; NDSTRL put it back");
+                    reverted.push(c.path.clone());
+                }
+            }
+        }
+        let model_short = route.model.trim_start_matches("claude-").to_string();
+        self.state.helper_runs.push(HelperRecord {
+            at: now(),
+            kind: format!("{kind:?}").to_lowercase(),
+            agent: route.provider.label().into(),
+            model: route.model.clone(),
+            usd: run.usd,
+            secs: run.secs,
+            ok: run.ok,
+            changed: changed.clone(),
+            reverted: reverted.clone(),
+        });
+        self.log("delegate", serde_json::json!({ "model": route.model, "usd": run.usd, "secs": run.secs, "ok": run.ok, "changed": changed, "reverted": reverted }));
+        let cost = run.usd.map(|u| format!("${u:.3}")).unwrap_or_else(|| "cost unknown".into());
+        let mut text = format!("Helper: {} {model_short} ({}), {cost}, {:.0}s.\n", route.provider.label(), route.why, run.secs);
+        match &run.error {
+            Some(e) if run.summary.is_empty() => text.push_str(&format!("It failed: {e}\n")),
+            _ => text.push_str(&run.summary),
+        }
+        if !changed.is_empty() {
+            text.push_str(&format!("\nChanged (recorded on the job): {}", changed.join(", ")));
+        }
+        if !reverted.is_empty() {
+            text.push_str(&format!("\nPut back (outside the job's scope): {}", reverted.join(", ")));
+        }
+        if kind.edits() && !changed.is_empty() {
+            text.push_str("\nRun `run_checks` to verify.");
+        }
+        self.charge(&text);
+        self.persist();
+        Outcome::Ok(text)
     }
 
     // ---- handoff ---------------------------------------------------------
@@ -832,6 +1013,101 @@ impl Job {
     }
 }
 
+/// Git snapshots so helper edits can be checked and undone.
+mod git {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn dirty(repo: &Path) -> Option<Vec<String>> {
+        let o = Command::new("git")
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .current_dir(repo)
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut parts = o.stdout.split(|b| *b == 0).filter(|p| !p.is_empty());
+        while let Some(p) = parts.next() {
+            if p.len() < 4 {
+                continue;
+            }
+            let renamed = p[0] == b'R' || p[0] == b'C';
+            out.push(String::from_utf8_lossy(&p[3..]).into_owned());
+            if renamed {
+                parts.next(); // the old path
+            }
+        }
+        Some(out)
+    }
+
+    fn head(repo: &Path, path: &str) -> Option<Vec<u8>> {
+        let o = Command::new("git").args(["show", &format!("HEAD:{path}")]).current_dir(repo).output().ok()?;
+        o.status.success().then_some(o.stdout)
+    }
+
+    pub struct Snapshot {
+        before: HashMap<String, Option<Vec<u8>>>,
+    }
+
+    pub struct Change {
+        pub path: String,
+        pub before: Option<Vec<u8>>,
+        pub after: Option<Vec<u8>>,
+    }
+
+    impl Change {
+        /// Put the file back exactly as it was before the helper ran.
+        pub fn restore(&self, repo: &Path) {
+            let p = repo.join(&self.path);
+            match &self.before {
+                Some(b) => {
+                    let _ = std::fs::write(p, b);
+                }
+                None => {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+    }
+
+    impl Snapshot {
+        pub fn take(repo: &Path) -> Option<Snapshot> {
+            let paths = dirty(repo)?;
+            let before = paths.into_iter().map(|p| {
+                let c = std::fs::read(repo.join(&p)).ok();
+                (p, c)
+            });
+            Some(Snapshot { before: before.collect() })
+        }
+
+        /// Files whose content differs from before the helper ran.
+        pub fn changes(&self, repo: &Path) -> Vec<Change> {
+            let now = dirty(repo).unwrap_or_default();
+            let mut paths: Vec<String> = now.clone();
+            for p in self.before.keys() {
+                if !paths.contains(p) {
+                    paths.push(p.clone());
+                }
+            }
+            let mut out = Vec::new();
+            for p in paths {
+                let after = std::fs::read(repo.join(&p)).ok();
+                let before = match self.before.get(&p) {
+                    Some(b) => b.clone(),
+                    None => head(repo, &p),
+                };
+                if before != after {
+                    out.push(Change { path: p, before, after });
+                }
+            }
+            out
+        }
+    }
+}
+
 fn diff_counts(before: Option<&str>, after: &str) -> (usize, usize) {
     let (mut add, mut rem) = (0, 0);
     for c in similar::TextDiff::from_lines(before.unwrap_or(""), after).iter_all_changes() {
@@ -866,9 +1142,16 @@ fn plan_view(s: &State) -> (Option<crate::plan::Estimate>, Option<crate::plan::E
 /// front office both call this, so they can never disagree.
 pub fn gauges_of(t: &JobSpec, s: &State) -> Gauges {
     let has_meter = s.transcript.is_some();
-    let spent = (has_meter && s.usage.unpriced_responses == 0 && s.carried.unpriced_responses == 0)
-        .then_some(s.usage.usd + s.carried.usd);
-    let tokens = if has_meter { s.usage.tokens() + s.carried.tokens() } else { s.factory_tokens };
+    // Helper runs report their own exact cost, so they count even when the
+    // main agent's transcript cannot be read.
+    let spent = if has_meter && s.usage.unpriced_responses == 0 && s.carried.unpriced_responses == 0 {
+        Some(s.usage.usd + s.carried.usd + s.delegated.usd)
+    } else if s.delegated.responses > 0 {
+        Some(s.delegated.usd)
+    } else {
+        None
+    };
+    let tokens = if has_meter { s.usage.tokens() + s.carried.tokens() + s.delegated.tokens() } else { s.factory_tokens + s.delegated.tokens() };
     let (p5, p7, d5, d7) = plan_view(s);
     Gauges {
         spent_usd: spent,
@@ -879,7 +1162,7 @@ pub fn gauges_of(t: &JobSpec, s: &State) -> Gauges {
         },
         tokens,
         budget_tokens: t.budget_tokens,
-        meter: if has_meter { "transcript" } else { "NDSTRL estimate" },
+        meter: if has_meter { "transcript" } else if s.delegated.responses > 0 { "helpers only; main agent unmetered" } else { "NDSTRL estimate" },
         files_touched: s.touched.len(),
         checks: match s.check_runs.last() {
             None => "not run",
@@ -1005,6 +1288,40 @@ mod tests {
         std::fs::write(d.path().join("guard_ok"), "").unwrap();
         assert!(matches!(job.inspect(), Outcome::Ok(t) if t.starts_with("PASS")));
         assert!(job.state.done);
+    }
+
+    #[test]
+    fn helper_edits_outside_scope_are_put_back() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(["-c", "user.email=t@t", "-c", "user.name=t"]).args(args).current_dir(r).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(r.join("in.rs"), "a\n").unwrap();
+        std::fs::write(r.join("out.rs"), "b\n").unwrap();
+        std::fs::write(r.join("dirty.rs"), "c\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        // A file the person was already editing, before the helper ran.
+        std::fs::write(r.join("dirty.rs"), "mine\n").unwrap();
+        let snap = git::Snapshot::take(r).unwrap();
+        // The helper changes everything it can reach.
+        std::fs::write(r.join("in.rs"), "A\n").unwrap();
+        std::fs::write(r.join("out.rs"), "B\n").unwrap();
+        std::fs::write(r.join("dirty.rs"), "helper\n").unwrap();
+        std::fs::write(r.join("new.rs"), "n\n").unwrap();
+        let mut ch = snap.changes(r);
+        ch.sort_by(|a, b| a.path.cmp(&b.path));
+        let paths: Vec<_> = ch.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["dirty.rs", "in.rs", "new.rs", "out.rs"]);
+        for c in ch.iter().filter(|c| c.path != "in.rs") {
+            c.restore(r);
+        }
+        assert_eq!(std::fs::read_to_string(r.join("in.rs")).unwrap(), "A\n");
+        assert_eq!(std::fs::read_to_string(r.join("out.rs")).unwrap(), "b\n");
+        assert_eq!(std::fs::read_to_string(r.join("dirty.rs")).unwrap(), "mine\n");
+        assert!(!r.join("new.rs").exists());
     }
 
     #[test]

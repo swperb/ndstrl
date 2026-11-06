@@ -58,6 +58,14 @@ pub struct JobSpec {
     /// before the job counts as done, so a fix here cannot break things there.
     #[serde(default)]
     pub guard: Option<String>,
+    /// Extra tools this job may use, beyond reading and editing code.
+    /// "web" lets helpers search and read docs online.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Whether hard problems may go to the frontier model (Fable). Off by
+    /// default: one Fable question can eat a big share of a week's plan.
+    #[serde(default)]
+    pub allow_frontier: bool,
     /// Whether checks may use the network. Recorded, and enforced
     /// where the platform allows it.
     #[serde(default)]
@@ -98,6 +106,8 @@ impl Default for JobSpec {
             max_changed_lines: None,
             max_minutes: None,
             guard: None,
+            tools: vec![],
+            allow_frontier: false,
             network: false,
             ask_below: default_ask_below(),
             check_timeout_secs: default_check_timeout(),

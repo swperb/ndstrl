@@ -13,7 +13,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub const INSTRUCTIONS: &str = "NDSTRL holds the job (goal, editable paths, test command, budget) and enforces it, whichever agent you are. Call `job_open` first. Then work only through these tools: `search`, `read` and `list_files` to look at code (they return short excerpts, so do not dump whole files), `edit` and `write` to change it, and `run_checks` to run the tests on this computer instead of reasoning about them. Every result ends with a status line: budget, files touched, checks, done. If the goal can only be met by going outside the job's scope (a refused path, a design choice, a second source of truth), call `ask` instead of working around it. If a result is a QUESTION, stop and put it to the user; never answer it yourself. When `run_checks` passes, the job is done: call `receipt`, report, and stop. Do not polish after the tests pass.";
+pub const INSTRUCTIONS: &str = "NDSTRL holds the job (goal, editable paths, test command, budget) and enforces it, whichever agent you are. Call `job_open` first. Then work only through these tools: `search`, `read` and `list_files` to look at code (they return short excerpts, so do not dump whole files), `edit` and `write` to change it, and `run_checks` to run the tests on this computer instead of reasoning about them, and `delegate` to hand look-ups, docs research, and already-decided edits to a cheaper helper instead of doing them yourself. Every result ends with a status line: budget, files touched, checks, done. If the goal can only be met by going outside the job's scope (a refused path, a design choice, a second source of truth), call `ask` instead of working around it. If a result is a QUESTION, stop and put it to the user; never answer it yourself. When `run_checks` passes, the job is done: call `receipt`, report, and stop. Do not polish after the tests pass.";
 
 pub struct Server {
     job: Option<Job>,
@@ -123,10 +123,19 @@ impl Server {
     fn call(&mut self, name: &str, args: &Value) -> Value {
         if name == "job_open" {
             return match tools::open(args, &self.agent) {
-                Ok((job, text)) => {
-                    let g = job.gauges();
+                Ok((job, outcome)) => {
                     self.job = Some(job);
-                    render(Outcome::Ok(text), Some(g))
+                    // An auto-mode draft goes straight to the person when the
+                    // client can ask them; otherwise the agent relays it.
+                    let outcome = match outcome {
+                        Outcome::Ask(q) if self.elicitation => match self.elicit(q).0 {
+                            Outcome::Ok(t) => Outcome::Ok(format!("{t}\n\n{}", tools::describe(self.job.as_ref().expect("job")))),
+                            o => o,
+                        },
+                        o => o,
+                    };
+                    let g = self.job.as_ref().map(|j| j.gauges());
+                    render(outcome, g)
                 }
                 Err(e) => render(Outcome::Denied(format!("{e:#}")), None),
             };
@@ -206,7 +215,9 @@ impl Server {
                     .unwrap_or("")
                     .to_string();
                 let yes = q.options.first().map(|f| f == &choice).unwrap_or(false);
+                let declined = q.options.len() > 1 && q.options.last() == Some(&choice);
                 let o = match job.answer(q.id, &choice, "human") {
+                    Outcome::Ok(t) if declined => Outcome::Denied(format!("The user said no (\"{choice}\"). {t}")),
                     Outcome::Ok(t) => Outcome::Ok(format!("NDSTRL asked the user directly. They chose \"{choice}\". {t}")),
                     o => o,
                 };
@@ -215,7 +226,7 @@ impl Server {
             Some("decline") => {
                 let no = q.options.last().cloned().unwrap_or_else(|| "no".into());
                 let o = match job.answer(q.id, &no, "human") {
-                    Outcome::Ok(t) => Outcome::Ok(format!("The user declined. {t}")),
+                    Outcome::Ok(t) => Outcome::Denied(format!("The user declined. {t}")),
                     o => o,
                 };
                 (o, false)
