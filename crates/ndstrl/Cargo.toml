@@ -1,0 +1,20 @@
+[package]
+name = "ndstrl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A software factory for coding agents: one job contract, any machine."
+
+[[bin]]
+name = "ndstrl"
+path = "src/main.rs"
+
+[dependencies]
+ndstrl-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+dirs.workspace = true
+ignore.workspace = true
+chrono.workspace = true
