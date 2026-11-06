@@ -28,6 +28,7 @@ fn real_main() -> Result<()> {
         Some("status") => status(),
         Some("bench") => bench::run(&args[1..]),
         Some("statusline") => statusline(),
+        Some("plans") => plans(),
         Some("--version" | "-V" | "version") => {
             println!("ndstrl {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -48,6 +49,7 @@ USAGE
         --dry-run             show what would change
   ndstrl init \"<goal>\"        write .ndstrl/job.toml in this repo
   ndstrl status               gauges for the job in this repo
+  ndstrl plans                your AI plans, how full each is, and where work goes
   ndstrl statusline           Claude Code status line: logs plan usage, prints gauges
   ndstrl bench [job..]        run bench jobs plain vs through ndstrl on real claude -p sessions
         --mode plain|ndstrl|both   --model <id>";
@@ -280,5 +282,33 @@ fn statusline() -> Result<()> {
         }
     }
     println!("{line}");
+    Ok(())
+}
+
+fn plans() -> Result<()> {
+    use ndstrl_core::route::{choose, pressures, Kind};
+    let ps = pressures();
+    if ps.is_empty() {
+        println!("No AI plans found. Install Claude Code or Codex.");
+        return Ok(());
+    }
+    for p in &ps {
+        println!(
+            "{:<22} {:<10} {:>12}   size {:>4}   room {:.2}",
+            p.provider.label(),
+            p.tier.replace('_', " "),
+            p.used_pct.map(|u| format!("{u:.0}% used")).unwrap_or_else(|| "no reading".into()),
+            p.weight,
+            p.room()
+        );
+    }
+    println!();
+    for (k, name) in [(Kind::Lookup, "look-ups"), (Kind::Research, "research"), (Kind::Edit, "edits"), (Kind::Hard, "hard problems")] {
+        match choose(k, false, &ps, None) {
+            Ok(r) => println!("{name:<14} -> {} {}", r.provider.label(), r.model),
+            Err(e) => println!("{name:<14} -> none ({e})"),
+        }
+    }
+    println!("\nSizes are rough defaults by tier. Override in ~/.ndstrl/plans.toml, e.g. codex = 1.0");
     Ok(())
 }

@@ -141,21 +141,81 @@ pub struct Route {
     pub why: String,
 }
 
-/// How full one subscription is: the fuller of its 5-hour and weekly
-/// windows, 0 to 100. `None` when NDSTRL has no reading for it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+/// How full one subscription is, and how big it is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Pressure {
     pub provider: Provider,
+    /// The fuller of its windows, 0 to 100. `None` without a reading.
     pub used_pct: Option<f64>,
+    /// The plan tier as the provider names it ("max_5x", "free", ...).
+    pub tier: String,
+    /// Rough usable work per window relative to a Claude Pro or ChatGPT
+    /// Plus plan (1.0). A free plan with 0% used still has little room.
+    pub weight: f64,
 }
 
 /// Unknown usage counts as half full: not preferred over a provider we
 /// know is nearly idle, not avoided like one we know is nearly spent.
 const UNKNOWN_PCT: f64 = 50.0;
 
-/// Current pressure on every installed provider.
+impl Pressure {
+    /// Room left, in plan-size units: what is unused times how big the plan is.
+    pub fn room(&self) -> f64 {
+        (100.0 - self.used_pct.unwrap_or(UNKNOWN_PCT)).max(0.0) / 100.0 * self.weight
+    }
+    pub fn is_free(&self) -> bool {
+        self.tier == "free"
+    }
+    fn describe(&self) -> String {
+        let used = self.used_pct.map(|p| format!("{p:.0}% used")).unwrap_or_else(|| "usage unknown".into());
+        format!("{} {} ({used})", self.provider.label(), self.tier.replace('_', " "))
+    }
+}
+
+/// Default capacity weights by tier. Rough by design; override them in
+/// `~/.ndstrl/plans.toml`, e.g. `claude = 5.0` or `codex = 1.0`.
+fn tier_weight(p: Provider, tier: &str) -> f64 {
+    let t = tier.to_ascii_lowercase();
+    match p {
+        Provider::Claude if t.contains("20x") => 20.0,
+        Provider::Claude if t.contains("5x") => 5.0,
+        Provider::Claude if t.contains("max") => 5.0,
+        Provider::Claude if t.contains("team") || t.contains("enterprise") => 1.5,
+        Provider::Codex if t == "free" => 0.2,
+        Provider::Codex if t == "plus" || t == "go" => 1.0,
+        Provider::Codex if t == "pro" => 6.0,
+        Provider::Codex if t.contains("team") || t.contains("business") || t.contains("enterprise") || t.contains("edu") => 1.5,
+        _ => 1.0,
+    }
+}
+
+fn overrides() -> std::collections::HashMap<String, f64> {
+    crate::plan::home()
+        .and_then(|h| std::fs::read_to_string(h.join("plans.toml")).ok())
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .map(|t| t.into_iter().filter_map(|(k, v)| v.as_float().or(v.as_integer().map(|i| i as f64)).map(|f| (k, f))).collect())
+        .unwrap_or_default()
+}
+
+/// The Claude plan tier, from Claude Code's own config. Not a credential:
+/// the same file names the account's rate-limit tier in plain text.
+fn claude_tier() -> String {
+    let path = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(|d| std::path::PathBuf::from(d).join(".claude.json"))
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude.json")));
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            let a = &v["oauthAccount"];
+            a["userRateLimitTier"].as_str().or(a["organizationRateLimitTier"].as_str()).map(|s| s.trim_start_matches("default_claude_").to_string())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Current pressure and size of every installed provider's plan.
 pub fn pressures() -> Vec<Pressure> {
-    let claude = crate::plan::latest().and_then(|s| {
+    let claude_used = crate::plan::latest().and_then(|s| {
         let now = chrono::Utc::now().timestamp();
         let live = |w: Option<crate::plan::Window>| w.filter(|w| w.resets_at == 0 || w.resets_at > now).map(|w| w.used_percentage);
         match (live(s.five_hour), live(s.seven_day)) {
@@ -163,20 +223,32 @@ pub fn pressures() -> Vec<Pressure> {
             (a, b) => Some(a.unwrap_or(0.0).max(b.unwrap_or(0.0))),
         }
     });
-    let codex = codex_limits().map(|(used, _)| used);
-    [(Provider::Claude, claude), (Provider::Codex, codex), (Provider::Cursor, None)]
-        .into_iter()
-        .filter(|(p, _)| p.installed())
-        .map(|(provider, used_pct)| Pressure { provider, used_pct })
-        .collect()
+    let codex = codex_limits();
+    let ov = overrides();
+    let mk = |provider: Provider, used_pct: Option<f64>, tier: String| {
+        let key = format!("{provider:?}").to_ascii_lowercase();
+        let weight = ov.get(&key).copied().unwrap_or_else(|| tier_weight(provider, &tier));
+        Pressure { provider, used_pct, tier, weight }
+    };
+    [
+        mk(Provider::Claude, claude_used, claude_tier()),
+        mk(Provider::Codex, codex.as_ref().map(|c| c.0), codex.map(|c| c.1).unwrap_or_else(|| "unknown".into())),
+        mk(Provider::Cursor, None, "unknown".into()),
+    ]
+    .into_iter()
+    .filter(|p| p.provider.installed())
+    .collect()
 }
 
-fn can_do(p: Provider, kind: Kind) -> bool {
-    match p {
+fn can_do(p: &Pressure, kind: Kind) -> bool {
+    let tool_ok = match p.provider {
         Provider::Claude => true,
         // Web research is wired up on Claude only for now.
         Provider::Codex | Provider::Cursor => kind != Kind::Research,
-    }
+    };
+    // Quality floor: free plans run weaker default models; give them
+    // read-only look-ups, never changes to the person's code.
+    tool_ok && !(p.is_free() && kind != Kind::Lookup)
 }
 
 fn model_for(p: Provider, kind: Kind, allow_frontier: bool) -> (&'static str, f64, &'static str) {
@@ -191,17 +263,17 @@ fn model_for(p: Provider, kind: Kind, allow_frontier: bool) -> (&'static str, f6
     }
 }
 
-/// Pick the route: among installed providers that can do this kind of
-/// work, the one whose subscription is least used, so no plan runs out
-/// while another sits idle. Ties go to Claude, whose cost NDSTRL can meter.
+/// Pick the route: among installed plans that can do this kind of work,
+/// the one with the most room left, sized by plan. So a big plan at 60%
+/// still beats a free plan at 0%, and no paid plan runs out while another
+/// sits idle. Ties go to Claude, whose cost NDSTRL can meter.
 pub fn choose(kind: Kind, allow_frontier: bool, pressure: &[Pressure], remaining_usd: Option<f64>) -> Result<Route, String> {
-    let mut options: Vec<&Pressure> = pressure.iter().filter(|p| can_do(p.provider, kind)).collect();
+    let mut options: Vec<&Pressure> = pressure.iter().filter(|p| can_do(p, kind)).collect();
     if options.is_empty() {
-        return Err("no helper agent that can do this is installed (looked for claude, codex, cursor-agent)".into());
+        return Err("no installed plan can take this kind of work (free plans only do look-ups)".into());
     }
-    let pct = |p: &Pressure| p.used_pct.unwrap_or(UNKNOWN_PCT);
     options.sort_by(|a, b| {
-        pct(a).partial_cmp(&pct(b)).unwrap().then_with(|| (a.provider != Provider::Claude).cmp(&(b.provider != Provider::Claude)))
+        b.room().partial_cmp(&a.room()).unwrap().then_with(|| (a.provider != Provider::Claude).cmp(&(b.provider != Provider::Claude)))
     });
     let best = options[0];
     let (model, cap, why) = model_for(best.provider, kind, allow_frontier);
@@ -209,32 +281,36 @@ pub fn choose(kind: Kind, allow_frontier: bool, pressure: &[Pressure], remaining
     if cap <= 0.0 {
         return Err("no budget left for a helper".into());
     }
-    let why = if options.len() > 1 {
-        let others: Vec<String> = options[1..]
-            .iter()
-            .map(|o| format!("{} {}", o.provider.label(), o.used_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "unknown".into())))
-            .collect();
-        format!(
-            "{why}; {} is the least used plan ({}) vs {}",
-            best.provider.label(),
-            best.used_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "unknown".into()),
-            others.join(", ")
-        )
-    } else {
+    let skipped: Vec<String> = pressure
+        .iter()
+        .filter(|p| p.provider != best.provider)
+        .map(|p| if can_do(p, kind) { p.describe() } else { format!("{} (not for this kind of work)", p.describe()) })
+        .collect();
+    let why = if skipped.is_empty() {
         why.to_string()
+    } else {
+        format!("{why}; most room left on {} vs {}", best.describe(), skipped.join(", "))
     };
     Ok(Route { provider: best.provider, model: model.into(), cap_usd: cap, why })
 }
 
 /// Which harness the main session should run in, when another plan has
-/// far more room than the one in use. NDSTRL cannot move the main session;
-/// it can say so.
+/// clearly more room than Claude. NDSTRL cannot move the main session; it
+/// can say so.
 pub fn main_session_hint(pressure: &[Pressure]) -> Option<String> {
-    let claude = pressure.iter().find(|p| p.provider == Provider::Claude)?.used_pct?;
-    let best = pressure.iter().filter(|p| p.provider != Provider::Claude && p.used_pct.is_some()).min_by(|a, b| a.used_pct.partial_cmp(&b.used_pct).unwrap())?;
-    let other = best.used_pct?;
-    (claude - other >= 30.0).then(|| {
-        format!("Your Claude plan is at {claude:.0}% and {} at {other:.0}%. Consider running this job in {} instead; the job spec moves with it.", best.provider.label(), best.provider.label())
+    let claude = pressure.iter().find(|p| p.provider == Provider::Claude)?;
+    claude.used_pct?;
+    let best = pressure
+        .iter()
+        .filter(|p| p.provider != Provider::Claude && p.used_pct.is_some() && !p.is_free())
+        .max_by(|a, b| a.room().partial_cmp(&b.room()).unwrap())?;
+    (best.room() >= claude.room() * 2.0 && best.room() >= 0.5).then(|| {
+        format!(
+            "{} has much more room than {}. Consider running this job in {} instead; the job spec moves with it.",
+            best.describe(),
+            claude.describe(),
+            best.provider.label()
+        )
     })
 }
 
@@ -421,24 +497,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn balances_across_plans() {
-        let p = |provider, used_pct| Pressure { provider, used_pct };
-        // Claude busy, Codex idle: routine work moves to Codex.
-        let r = choose(Kind::Edit, false, &[p(Provider::Claude, Some(78.0)), p(Provider::Codex, Some(12.0))], None).unwrap();
-        assert_eq!(r.provider, Provider::Codex);
-        // Research stays on Claude however busy it is (web tools).
-        let r = choose(Kind::Research, false, &[p(Provider::Claude, Some(78.0)), p(Provider::Codex, Some(12.0))], None).unwrap();
+    fn weighs_plans_by_size() {
+        let p = |provider, used: Option<f64>, tier: &str| Pressure { provider, used_pct: used, tier: tier.into(), weight: tier_weight(provider, tier) };
+        let max5 = |u| p(Provider::Claude, u, "claude_max_5x");
+        // A free plan at 0% does not outweigh Max 5x at 60%.
+        let r = choose(Kind::Lookup, false, &[max5(Some(60.0)), p(Provider::Codex, Some(0.0), "free")], None).unwrap();
         assert_eq!(r.provider, Provider::Claude);
-        // Unknown counts as half full: a known-idle Claude wins, a known-busy one loses.
-        assert_eq!(choose(Kind::Lookup, false, &[p(Provider::Claude, Some(20.0)), p(Provider::Cursor, None)], None).unwrap().provider, Provider::Claude);
-        assert_eq!(choose(Kind::Lookup, false, &[p(Provider::Claude, Some(70.0)), p(Provider::Cursor, None)], None).unwrap().provider, Provider::Cursor);
-        // Ties go to Claude; models follow the kind; budget caps the helper.
-        let r = choose(Kind::Lookup, false, &[p(Provider::Claude, None), p(Provider::Codex, None)], None).unwrap();
+        // But a nearly spent Max does hand look-ups to the free plan.
+        let r = choose(Kind::Lookup, false, &[max5(Some(97.0)), p(Provider::Codex, Some(0.0), "free")], None).unwrap();
+        assert_eq!(r.provider, Provider::Codex);
+        // Free plans never get edits or hard problems.
+        let r = choose(Kind::Edit, false, &[max5(Some(97.0)), p(Provider::Codex, Some(0.0), "free")], None).unwrap();
+        assert_eq!(r.provider, Provider::Claude);
+        // Two paid plans balance by room: Max 5x at 90% (0.5) vs Plus at 20% (0.8).
+        let r = choose(Kind::Edit, false, &[max5(Some(90.0)), p(Provider::Codex, Some(20.0), "plus")], None).unwrap();
+        assert_eq!(r.provider, Provider::Codex);
+        // Research stays on Claude; ties go to Claude; models follow the kind.
+        assert_eq!(choose(Kind::Research, false, &[max5(Some(99.0)), p(Provider::Codex, Some(0.0), "pro")], None).unwrap().provider, Provider::Claude);
+        let r = choose(Kind::Lookup, false, &[p(Provider::Claude, None, "x"), p(Provider::Codex, None, "y")], None).unwrap();
         assert_eq!((r.provider, r.model.as_str()), (Provider::Claude, "claude-haiku-5-5"));
-        assert_eq!(choose(Kind::Hard, true, &[p(Provider::Claude, None)], None).unwrap().model, "claude-fable-5-1");
-        assert!((choose(Kind::Edit, false, &[p(Provider::Claude, None)], Some(0.05)).unwrap().cap_usd - 0.05).abs() < 1e-9);
-        assert!(choose(Kind::Edit, false, &[p(Provider::Claude, None)], Some(0.0)).is_err());
-        assert!(main_session_hint(&[p(Provider::Claude, Some(72.0)), p(Provider::Codex, Some(20.0))]).unwrap().contains("Codex"));
-        assert!(main_session_hint(&[p(Provider::Claude, Some(40.0)), p(Provider::Codex, Some(20.0))]).is_none());
+        assert_eq!(choose(Kind::Hard, true, &[max5(None)], None).unwrap().model, "claude-fable-5-1");
+        assert!((choose(Kind::Edit, false, &[max5(None)], Some(0.05)).unwrap().cap_usd - 0.05).abs() < 1e-9);
+        assert!(choose(Kind::Edit, false, &[max5(None)], Some(0.0)).is_err());
+        // The main-session hint ignores free plans and needs a clear gap.
+        assert!(main_session_hint(&[max5(Some(95.0)), p(Provider::Codex, Some(0.0), "free")]).is_none());
+        assert!(main_session_hint(&[max5(Some(95.0)), p(Provider::Codex, Some(10.0), "pro")]).unwrap().contains("Codex"));
+        assert!(main_session_hint(&[max5(Some(40.0)), p(Provider::Codex, Some(10.0), "plus")]).is_none());
     }
 }
