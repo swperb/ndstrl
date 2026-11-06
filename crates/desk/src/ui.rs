@@ -20,7 +20,7 @@ fn until(epoch: i64) -> String {
 }
 
 #[component]
-pub fn Page(view: View, on_answer: EventHandler<(u32, String)>) -> Element {
+pub fn Page(view: View, on_answer: EventHandler<(u32, String)>, on_steer: EventHandler<String>) -> Element {
     rsx! {
         div { class: "app",
             header { class: "top",
@@ -30,7 +30,7 @@ pub fn Page(view: View, on_answer: EventHandler<(u32, String)>) -> Element {
             }
             main { class: "body",
                 match (&view.spec, &view.state) {
-                    (Some(_), Some(_)) => rsx! { Job { view: view.clone(), on_answer } },
+                    (Some(_), Some(_)) => rsx! { Job { view: view.clone(), on_answer, on_steer } },
                     _ => rsx! { Idle {} },
                 }
             }
@@ -60,12 +60,28 @@ fn Plan(view: View) -> Element {
 }
 
 #[component]
-fn Job(view: View, on_answer: EventHandler<(u32, String)>) -> Element {
+fn Job(view: View, on_answer: EventHandler<(u32, String)>, on_steer: EventHandler<String>) -> Element {
     let spec = view.spec.clone().unwrap();
     let st = view.state.clone().unwrap();
     let g = view.gauges.clone().unwrap();
     let status = view.status();
     let open_q = st.questions.iter().find(|q| q.answer.is_none()).cloned();
+    let decisions: Vec<_> = st.questions.iter().filter(|q| q.answer.is_some()).rev().take(8).cloned().collect();
+    let mut draft = use_signal(String::new);
+    // An open question from the agent itself is answered by what you type;
+    // otherwise what you type is a message steering the agent.
+    let agent_q = open_q.as_ref().filter(|q| matches!(q.kind, ndstrl_core::job::QuestionKind::Agent)).map(|q| q.id);
+    let send = move |_| {
+        let text = draft.peek().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        match agent_q {
+            Some(id) => on_answer.call((id, text)),
+            None => on_steer.call(text),
+        }
+        draft.set(String::new());
+    };
     let agent = if st.agent.is_empty() { "The agent".to_string() } else { st.agent.split(' ').next().unwrap_or("").to_string() };
     let files = st.touched.len();
     let checks = match st.check_runs.last() {
@@ -108,8 +124,40 @@ fn Job(view: View, on_answer: EventHandler<(u32, String)>) -> Element {
                             "{o}"
                         }
                     }
+                    button {
+                        class: "btn ghost",
+                        title: "Decline this and have the agent carry on with the rest of the job",
+                        onclick: {
+                            let id = q.id;
+                            let skip = if matches!(q.kind, ndstrl_core::job::QuestionKind::Agent) { "skip".to_string() } else { q.options.last().cloned().unwrap_or_else(|| "skip".into()) };
+                            move |_| on_answer.call((id, skip.clone()))
+                        },
+                        "Skip this"
+                    }
                 }
             }
+        }
+        div { class: "steer",
+            input {
+                class: "steer-input",
+                r#type: "text",
+                placeholder: if agent_q.is_some() { "Answer the agent…" } else { "Message the agent: steer it, narrow it, tell it to skip something…" },
+                value: "{draft}",
+                oninput: move |e| draft.set(e.value()),
+                onkeydown: move |e| {
+                    if e.key() == Key::Enter {
+                        let text = draft.peek().trim().to_string();
+                        if !text.is_empty() {
+                            match agent_q {
+                                Some(id) => on_answer.call((id, text)),
+                                None => on_steer.call(text),
+                            }
+                            draft.set(String::new());
+                        }
+                    }
+                },
+            }
+            button { class: "btn", onclick: send, "Send" }
         }
         div { class: "budget",
             div { class: "bar", i { style: "width: {frac.unwrap_or(0.0) * 100.0:.1}%" } }
@@ -121,6 +169,13 @@ fn Job(view: View, on_answer: EventHandler<(u32, String)>) -> Element {
                 }
             }
         }
+        if !st.notes.is_empty() {
+            ul { class: "log",
+                for n in st.notes.iter().rev().take(4) {
+                    li { span { class: "dim", if n.delivered { "You told the agent: " } else { "Waiting for the agent's next step: " } } "{n.text}" }
+                }
+            }
+        }
         if !st.touched.is_empty() {
             ul { class: "files",
                 for (path, t) in st.touched.iter() {
@@ -128,6 +183,18 @@ fn Job(view: View, on_answer: EventHandler<(u32, String)>) -> Element {
                         span { class: "path", "{path}" }
                         span { class: "add", "+{t.added}" }
                         span { class: "del", "−{t.removed}" }
+                    }
+                }
+            }
+        }
+        if !decisions.is_empty() {
+            div { class: "section-label", "Decisions" }
+            ul { class: "log",
+                for q in decisions.iter() {
+                    li {
+                        span { "{q.text}" }
+                        span { class: "dim", " → {q.answer.clone().unwrap_or_default()}" }
+                        if q.answered_via.as_deref() == Some("agent") { span { class: "dim", " (relayed by the agent)" } }
                     }
                 }
             }

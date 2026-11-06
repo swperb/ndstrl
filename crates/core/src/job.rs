@@ -117,6 +117,17 @@ pub struct State {
     pub delegated: Usage,
     #[serde(default)]
     pub helper_runs: Vec<HelperRecord>,
+    /// Messages the person sent from the window, delivered to the agent
+    /// with its next tool result.
+    #[serde(default)]
+    pub notes: Vec<Note>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Note {
+    pub at: String,
+    pub text: String,
+    pub delivered: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -395,6 +406,11 @@ impl Job {
         let _ = std::fs::write(&p, "");
         for line in text.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if let Some(text) = v["steer"].as_str() {
+                self.state.notes.push(Note { at: now(), text: text.to_string(), delivered: false });
+                self.log("steer", serde_json::json!({ "text": text }));
+                continue;
+            }
             let (Some(id), Some(ans)) = (v["question_id"].as_u64(), v["answer"].as_str()) else { continue };
             let _ = self.answer(id as u32, ans, "human");
         }
@@ -405,6 +421,25 @@ impl Job {
     pub fn post_answer(repo: &Path, question_id: u32, answer: &str) -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(repo.join(DIR).join("inbox.jsonl"))?;
         writeln!(f, "{}", serde_json::json!({ "question_id": question_id, "answer": answer, "at": now() }))
+    }
+
+    /// Queue a message for the agent from outside the server (the window).
+    pub fn post_steer(repo: &Path, text: &str) -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(repo.join(DIR).join("inbox.jsonl"))?;
+        writeln!(f, "{}", serde_json::json!({ "steer": text, "at": now() }))
+    }
+
+    /// Messages from the person not yet shown to the agent; marks them shown.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        self.refresh();
+        let out: Vec<String> = self.state.notes.iter().filter(|n| !n.delivered).map(|n| n.text.clone()).collect();
+        if !out.is_empty() {
+            for n in self.state.notes.iter_mut() {
+                n.delivered = true;
+            }
+            self.persist();
+        }
+        out
     }
 
     fn ask_inner(&mut self, kind: QuestionKind, text: String, options: Vec<String>) -> Question {
@@ -460,6 +495,9 @@ impl Job {
                 self.state.capped = true;
                 let r = self.write_receipt().unwrap_or_default();
                 format!("The user chose to stop. Receipt: {r}. Report and end the run.")
+            }
+            QuestionKind::Agent if answer.trim().eq_ignore_ascii_case("skip") => {
+                "The user chose to skip this. Drop that part and continue with the rest of the job.".to_string()
             }
             QuestionKind::Agent => format!("Recorded. The user said: {answer}"),
             QuestionKind::Size { what } if yes || answer.to_ascii_lowercase().starts_with("keep") => {
@@ -827,6 +865,15 @@ impl Job {
                 lines: s.touched.values().map(|x| x.added + x.removed).sum(),
                 usd: g.spent_usd.unwrap_or(s.delegated.usd),
                 done: s.done,
+                at: now(),
+                repo: self.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                goal: t.goal.clone(),
+                agent: s.agent.clone(),
+                tokens: g.tokens,
+                plan_5h_pts: g.job_5h_pts,
+                plan_7d_pts: g.job_7d_pts,
+                helper_usd: s.delegated.usd,
+                minutes: self.minutes_running(),
             });
         }
         std::fs::write(
@@ -1329,6 +1376,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(r.join("out.rs")).unwrap(), "b\n");
         assert_eq!(std::fs::read_to_string(r.join("dirty.rs")).unwrap(), "mine\n");
         assert!(!r.join("new.rs").exists());
+    }
+
+    #[test]
+    fn window_message_reaches_the_agent_once() {
+        let _g = isolate();
+        let d = tempfile::tempdir().unwrap();
+        let mut job = Job::open(d.path(), Some(JobSpec { goal: "g".into(), ..Default::default() }), "test").unwrap();
+        Job::post_steer(d.path(), "Skip the CSS; only fix the logic").unwrap();
+        assert_eq!(job.take_notes(), vec!["Skip the CSS; only fix the logic".to_string()]);
+        assert!(job.take_notes().is_empty());
+        let q = match job.ask("Refactor the form too?", vec!["yes".into(), "no".into()]) {
+            Outcome::Ask(q) => q,
+            o => panic!("{o:?}"),
+        };
+        Job::post_answer(d.path(), q.id, "skip").unwrap();
+        job.refresh();
+        assert_eq!(job.state.questions[0].answer.as_deref(), Some("skip"));
     }
 
     #[test]

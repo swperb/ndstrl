@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 /// Root used for static snapshots: same Page, no live data, no clicks.
 #[component]
 pub fn SnapshotRoot(view: model::View) -> Element {
-    rsx! { ui::Page { view, on_answer: move |_| {} } }
+    rsx! { ui::Page { view, on_answer: move |_| {}, on_steer: move |_| {} } }
 }
 
 /// Render a full HTML document for a view, for UI tests and screenshots.

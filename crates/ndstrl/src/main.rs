@@ -29,6 +29,7 @@ fn real_main() -> Result<()> {
         Some("bench") => bench::run(&args[1..]),
         Some("statusline") => statusline(),
         Some("plans") => plans(),
+        Some("report") => report(&args[1..]),
         Some("--version" | "-V" | "version") => {
             println!("ndstrl {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -50,6 +51,7 @@ USAGE
   ndstrl init \"<goal>\"        write .ndstrl/job.toml in this repo
   ndstrl status               gauges for the job in this repo
   ndstrl plans                your AI plans, how full each is, and where work goes
+  ndstrl report [--days N]    what your jobs cost, by project, and what used your windows
   ndstrl statusline           Claude Code status line: logs plan usage, prints gauges
   ndstrl bench [job..]        run bench jobs plain vs through ndstrl on real claude -p sessions
         --mode plain|ndstrl|both   --model <id>";
@@ -310,5 +312,82 @@ fn plans() -> Result<()> {
         }
     }
     println!("\nSizes are rough defaults by tier. Override in ~/.ndstrl/plans.toml, e.g. codex = 1.0");
+    Ok(())
+}
+
+fn report(args: &[String]) -> Result<()> {
+    use std::collections::BTreeMap;
+    let days: i64 = args.iter().position(|a| a == "--days").and_then(|i| args.get(i + 1)).and_then(|d| d.parse().ok()).unwrap_or(7);
+    let since = chrono::Utc::now() - chrono::Duration::days(days);
+    let rows: Vec<_> = ndstrl_core::auto::history()
+        .into_iter()
+        .filter(|r| r.at.is_empty() || chrono::DateTime::parse_from_rfc3339(&r.at).map(|t| t >= since).unwrap_or(true))
+        .collect();
+
+    // Where the plan stands now.
+    if let Some(s) = ndstrl_core::plan::latest() {
+        let w = |x: Option<ndstrl_core::plan::Window>| x.map(|w| format!("{:.0}%", w.used_percentage)).unwrap_or_else(|| "-".into());
+        println!("Claude plan now: 5-hour {}, week {}", w(s.five_hour), w(s.seven_day));
+    } else {
+        println!("Claude plan now: no status-line reading yet (open a Claude Code session once).");
+    }
+    if let Some((used, tier)) = ndstrl_core::route::codex_limits() {
+        println!("Codex plan now:  {used:.0}% ({tier})");
+    }
+    println!();
+    if rows.is_empty() {
+        println!("No finished jobs in the last {days} days. Jobs are logged when they pass their checks or stop.");
+        return Ok(());
+    }
+
+    let total: f64 = rows.iter().map(|r| r.usd).sum();
+    let helpers: f64 = rows.iter().map(|r| r.helper_usd).sum();
+    let p5: f64 = rows.iter().filter_map(|r| r.plan_5h_pts).sum();
+    let p7: f64 = rows.iter().filter_map(|r| r.plan_7d_pts).sum();
+    let measured = rows.iter().filter(|r| r.plan_7d_pts.is_some()).count();
+    println!(
+        "Last {days} days: {} jobs ({} done), ${total:.2} at API prices, ${:.2} per job, {:.0}% of it on helpers",
+        rows.len(),
+        rows.iter().filter(|r| r.done).count(),
+        total / rows.len() as f64,
+        if total > 0.0 { helpers / total * 100.0 } else { 0.0 }
+    );
+    if measured > 0 {
+        println!("Plan windows used by these jobs: {p5:.1} points of 5-hour windows, {p7:.1} points of the week ({measured} jobs with readings)");
+    }
+
+    // By project: which workflows cost what.
+    let mut by: BTreeMap<String, (usize, f64, f64, u64)> = BTreeMap::new();
+    for r in &rows {
+        let e = by.entry(if r.repo.is_empty() { "(unknown)".into() } else { r.repo.clone() }).or_default();
+        e.0 += 1;
+        e.1 += r.usd;
+        e.2 += r.plan_7d_pts.unwrap_or(0.0);
+        e.3 += r.minutes;
+    }
+    let mut by: Vec<_> = by.into_iter().collect();
+    by.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+    println!("\nBy project:");
+    for (repo, (n, usd, wk, mins)) in &by {
+        let wk = if *wk > 0.0 { format!(", {wk:.1} pts of the week") } else { String::new() };
+        println!("  {repo:<24} {n:>3} job{}  ${usd:>7.2}  {:>4} min{wk}", if *n == 1 { " " } else { "s" }, mins);
+    }
+
+    // The jobs that cost the most, so the expensive kinds of work stand out.
+    let mut top: Vec<_> = rows.iter().collect();
+    top.sort_by(|a, b| b.usd.partial_cmp(&a.usd).unwrap());
+    println!("\nCostliest jobs:");
+    for r in top.iter().take(5) {
+        let goal: String = r.goal.chars().take(60).collect();
+        println!(
+            "  ${:>6.2}  {:>3} files {:>4} lines {:>4} min  {}{}",
+            r.usd,
+            r.files,
+            r.lines,
+            r.minutes,
+            goal,
+            if r.done { "" } else { "  (stopped)" }
+        );
+    }
     Ok(())
 }

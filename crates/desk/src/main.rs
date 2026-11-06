@@ -33,6 +33,7 @@ fn Root() -> Element {
         move || model::load(&repo)
     });
     let answer_repo = repo.clone();
+    let steer_repo = repo.clone();
     use_future(move || {
         let repo = repo.clone();
         async move {
@@ -57,6 +58,14 @@ fn Root() -> Element {
                         q.answer = Some(answer.clone());
                         q.answered_via = Some("human".into());
                     }
+                }
+                view.set(v);
+            },
+            on_steer: move |text: String| {
+                let _ = ndstrl_core::Job::post_steer(&steer_repo, &text);
+                let mut v = view.peek().clone();
+                if let Some(st) = v.state.as_mut() {
+                    st.notes.push(ndstrl_core::job::Note { at: String::new(), text, delivered: false });
                 }
                 view.set(v);
             },

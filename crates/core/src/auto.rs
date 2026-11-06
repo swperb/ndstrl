@@ -149,6 +149,28 @@ pub struct HistoryRow {
     pub lines: usize,
     pub usd: f64,
     pub done: bool,
+    /// When the job closed (RFC 3339), which project, and what it was.
+    #[serde(default)]
+    pub at: String,
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub goal: String,
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub tokens: u64,
+    /// Points of the plan's 5-hour and weekly windows this job used,
+    /// when a status-line reading existed at both ends.
+    #[serde(default)]
+    pub plan_5h_pts: Option<f64>,
+    #[serde(default)]
+    pub plan_7d_pts: Option<f64>,
+    /// How much of the cost went to helpers, and how long the job ran.
+    #[serde(default)]
+    pub helper_usd: f64,
+    #[serde(default)]
+    pub minutes: u64,
 }
 
 pub fn history() -> Vec<HistoryRow> {
@@ -190,7 +212,17 @@ fn estimate(files: usize, scope_tokens: u64, hist: &[HistoryRow]) -> (f64, f64, 
 pub fn propose(repo: &Path, goal: &str) -> Proposal {
     let t = terms(goal);
     let (scored, per_dir) = candidates(repo, &t);
-    let files: Vec<String> = scored.iter().take(6).filter(|(_, s)| *s >= scored.first().map(|f| f.1 / 4).unwrap_or(0)).map(|(f, _)| f.clone()).collect();
+    // Tests define done; a draft never lets the agent edit them. They stay
+    // readable, and editing them is a widening the person can choose.
+    let is_test = |f: &str| {
+        let l = f.to_ascii_lowercase();
+        l.starts_with("tests/") || l.starts_with("test/") || l.contains("/tests/") || l.contains("/__tests__/")
+            || l.contains("_test.") || l.contains(".test.") || l.contains(".spec.") || l.contains("test_")
+    };
+    let (tests, code): (Vec<_>, Vec<_>) = scored.iter().partition(|(f, _)| is_test(f));
+    let top = code.first().map(|f| f.1 / 4).unwrap_or(0);
+    let files: Vec<String> = code.iter().take(6).filter(|(_, s)| *s >= top).map(|(f, _)| f.clone()).collect();
+    let matched_tests: Vec<String> = tests.iter().take(3).map(|(f, _)| f.clone()).collect();
     let scope_bytes: u64 = files.iter().filter_map(|f| std::fs::metadata(repo.join(f)).ok()).map(|m| m.len()).sum();
     let (low, high, basis) = estimate(files.len().max(1), scope_bytes / 4, &history());
 
@@ -219,7 +251,7 @@ pub fn propose(repo: &Path, goal: &str) -> Proposal {
         .iter()
         .filter_map(|f| f.rsplit_once('/').map(|(d, _)| d.to_string()))
         .filter_map(|d| per_dir.get(&d).map(|n| (d, *n)))
-        .filter(|(_, n)| *n > 1)
+        .filter(|(d, n)| *n > 1 && !is_test(&format!("{d}/")))
         .collect();
     dirs.sort();
     dirs.dedup();
@@ -234,6 +266,17 @@ pub fn propose(repo: &Path, goal: &str) -> Proposal {
             ),
             cost: format!("estimate rises to ${wl:.2} to ${wh:.2}"),
             apply: Apply::Paths(dirs.iter().map(|(d, _)| d.clone()).collect()),
+        });
+    }
+    if !matched_tests.is_empty() {
+        widen.push(Widen {
+            option: "Approve + allow test edits".into(),
+            why: format!(
+                "Let the agent change {} too. Only if the tests themselves are wrong; editing tests to make them pass hides bugs.",
+                matched_tests.join(", ")
+            ),
+            cost: "no extra cost".into(),
+            apply: Apply::Paths(matched_tests.clone()),
         });
     }
     let hard = ["race", "concurren", "deadlock", "flaky", "intermittent", "architecture", "redesign", "performance", "memory leak", "security"]
@@ -302,9 +345,12 @@ mod tests {
         std::fs::write(r.join("src/settings/save.rs"), "fn save_settings() {}\n").unwrap();
         std::fs::write(r.join("src/settings/form.rs"), "fn form() {}\n").unwrap();
         std::fs::write(r.join("src/other.rs"), "fn other() {}\n").unwrap();
+        std::fs::create_dir_all(r.join("tests")).unwrap();
+        std::fs::write(r.join("tests/save_settings.rs"), "#[test] fn save_settings_works() {}\n").unwrap();
         let p = propose(r, "Fix save_settings so the settings page persists; check the serde docs");
         assert_eq!(p.files.first().map(String::as_str), Some("src/settings/save.rs"));
         assert!(!p.files.contains(&"src/other.rs".to_string()));
+        assert!(p.files.iter().all(|f| !f.starts_with("tests/")));
         assert_eq!(p.spec.test.as_deref(), Some("cargo test -q"));
         assert!(p.widen.iter().any(|w| w.apply == Apply::Web));
         assert!(p.high_usd >= p.low_usd && p.low_usd > 0.0);

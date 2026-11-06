@@ -55,6 +55,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let root = find_bench_root()?;
     let mut modes = vec!["plain", "ndstrl"];
     let mut model: Option<String> = None;
+    let mut trials: usize = 1;
     let mut names = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -69,6 +70,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 };
             }
             "--model" => model = Some(it.next().context("--model needs a value")?.clone()),
+            "--trials" => trials = it.next().context("--trials needs a number")?.parse().context("--trials needs a number")?,
             other => names.push(other.to_string()),
         }
     }
@@ -88,14 +90,16 @@ pub fn run(args: &[String]) -> Result<()> {
         let dir = parts_dir.join(name);
         let part: Part = toml::from_str(&std::fs::read_to_string(dir.join("part.toml"))?)
             .with_context(|| format!("parsing {name}/part.toml"))?;
+        for trial in 1..=trials {
         for mode in &modes {
-            eprintln!("bench: {name} on {mode} …");
+            eprintln!("bench: {name} on {mode}, trial {trial} …");
             let s = run_one(name, &dir, &part, mode, &exe, model.as_deref())?;
             eprintln!(
                 "bench: {name} {mode}: accepted={} ${:.3} {} tok, {} turns, outside={:?}, questions={}",
                 s.accepted, s.list_usd, s.tokens, s.turns, s.outside_scope, s.questions
             );
             scores.push(s);
+        }
         }
     }
     let out = write_report(&root, &scores, model.as_deref())?;

@@ -13,7 +13,7 @@ use std::sync::mpsc::{channel, Receiver};
 
 const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub const INSTRUCTIONS: &str = "NDSTRL holds the job (goal, editable paths, test command, budget) and enforces it, whichever agent you are. Call `job_open` first. Then work only through these tools: `search`, `read` and `list_files` to look at code (they return short excerpts, so do not dump whole files), `edit` and `write` to change it, and `run_checks` to run the tests on this computer instead of reasoning about them, and `delegate` to hand look-ups, docs research, and already-decided edits to a cheaper helper instead of doing them yourself. Every result ends with a status line: budget, files touched, checks, done. If the goal can only be met by going outside the job's scope (a refused path, a design choice, a second source of truth), call `ask` instead of working around it. If a result is a QUESTION, stop and put it to the user; never answer it yourself. When `run_checks` passes, the job is done: call `receipt`, report, and stop. Do not polish after the tests pass.";
+pub const INSTRUCTIONS: &str = "NDSTRL holds the job (goal, editable paths, test command, budget) and enforces it, whichever agent you are. Call `job_open` first. Then work only through these tools: `search`, `read` and `list_files` to look at code (they return short excerpts, so do not dump whole files), `edit` and `write` to change it, and `run_checks` to run the tests on this computer instead of reasoning about them, and `delegate` to hand look-ups, docs research, and already-decided edits to a cheaper helper instead of doing them yourself. Every result ends with a status line: budget, files touched, checks, done. If the goal can only be met by going outside the job's scope (a refused path, a design choice, a second source of truth), call `ask` instead of working around it. If a result is a QUESTION, stop and put it to the user; never answer it yourself. If you are unsure whether a step fits the budget or the job, call `ask` before doing it. A MESSAGE FROM THE USER in a result is the user steering you: follow it. When `run_checks` passes, the job is done: call `receipt`, report, and stop. Do not polish after the tests pass.";
 
 pub struct Server {
     job: Option<Job>,
@@ -178,6 +178,19 @@ impl Server {
                 }
             }
             o => o,
+        };
+        // Anything the person typed in the window rides on this result.
+        let outcome = match self.job.as_mut().map(|j| j.take_notes()).unwrap_or_default() {
+            notes if notes.is_empty() => outcome,
+            notes => {
+                let msg = notes.iter().map(|n| format!("MESSAGE FROM THE USER (sent from the NDSTRL window): {n}")).collect::<Vec<_>>().join("\n");
+                match outcome {
+                    Outcome::Ok(t) => Outcome::Ok(format!("{msg}\n\n{t}")),
+                    Outcome::Denied(t) => Outcome::Denied(format!("{t}\n\n{msg}")),
+                    Outcome::Blocked(t) => Outcome::Blocked(format!("{t}\n\n{msg}")),
+                    Outcome::Ask(q) => Outcome::Ask(q),
+                }
+            }
         };
         let g = self.job.as_ref().map(|j| j.gauges());
         render(outcome, g)
