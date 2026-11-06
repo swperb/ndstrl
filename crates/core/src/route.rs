@@ -65,14 +65,70 @@ impl Provider {
         }
     }
     pub fn installed(self) -> bool {
-        which(self.bin())
+        self.path().is_some()
+    }
+
+    /// Where the CLI lives. Codex also ships inside the ChatGPT app.
+    pub fn path(self) -> Option<std::path::PathBuf> {
+        if self == Provider::Codex {
+            if let Ok(p) = std::env::var("NDSTRL_CODEX") {
+                return Some(p.into());
+            }
+        }
+        if let Some(p) = which_path(self.bin()) {
+            return Some(p);
+        }
+        let bundled: &[&str] = match self {
+            Provider::Codex => &["/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"],
+            _ => &[],
+        };
+        bundled.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
     }
 }
 
-fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(bin).is_file() || d.join(format!("{bin}.exe")).is_file()))
-        .unwrap_or(false)
+fn which_path(bin: &str) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).flat_map(|d| [d.join(bin), d.join(format!("{bin}.exe"))]).find(|p| p.is_file())
+}
+
+/// The Codex plan's latest rate-limit reading, from its own session logs:
+/// (fuller window's used percent, plan type). No request is made.
+pub fn codex_limits() -> Option<(f64, String)> {
+    let base = std::env::var("CODEX_HOME").map(std::path::PathBuf::from).ok().or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?.join("sessions");
+    // sessions/YYYY/MM/DD/rollout-*.jsonl; walk newest-first.
+    let newest_dir = |p: &std::path::Path| -> Option<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(p).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        v.sort();
+        v.pop()
+    };
+    let day = newest_dir(&newest_dir(&newest_dir(&base)?)?)?;
+    let mut files: Vec<_> = std::fs::read_dir(&day).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false)).collect();
+    files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    let now = chrono::Utc::now().timestamp();
+    for f in files.iter().rev() {
+        let text = std::fs::read_to_string(f).ok()?;
+        for line in text.lines().rev().filter(|l| l.contains("\"rate_limits\"")) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let Some(rl) = find_key(&v, "rate_limits") else { continue };
+            let win = |k: &str| -> Option<f64> {
+                let w = rl.get(k)?;
+                let resets = w.get("resets_at").and_then(|x| x.as_i64()).unwrap_or(0);
+                (resets == 0 || resets > now).then(|| w.get("used_percent").and_then(|x| x.as_f64())).flatten()
+            };
+            let used = win("primary").unwrap_or(0.0).max(win("secondary").unwrap_or(0.0));
+            let plan = rl.get("plan_type").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+            return Some((used, plan));
+        }
+    }
+    None
+}
+
+fn find_key<'a>(v: &'a serde_json::Value, k: &str) -> Option<&'a serde_json::Value> {
+    match v {
+        serde_json::Value::Object(m) => m.get(k).or_else(|| m.values().find_map(|x| find_key(x, k))),
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_key(x, k)),
+        _ => None,
+    }
 }
 
 /// Where one piece of work goes.
@@ -107,10 +163,7 @@ pub fn pressures() -> Vec<Pressure> {
             (a, b) => Some(a.unwrap_or(0.0).max(b.unwrap_or(0.0))),
         }
     });
-    let codex = crate::plan::home()
-        .and_then(|h| std::fs::read_to_string(h.join("codex-limits.json")).ok())
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v["used_pct"].as_f64());
+    let codex = codex_limits().map(|(used, _)| used);
     [(Provider::Claude, claude), (Provider::Codex, codex), (Provider::Cursor, None)]
         .into_iter()
         .filter(|(p, _)| p.installed())
@@ -198,7 +251,7 @@ pub struct HelperRun {
 
 /// The brief a helper gets. Short, scoped, and asking for a short answer,
 /// because the answer lands in the main agent's context.
-pub fn brief(kind: Kind, goal: &str, task: &str, allow: &[String], deny: &[String]) -> String {
+pub fn brief(provider: Provider, kind: Kind, goal: &str, task: &str, allow: &[String], deny: &[String]) -> String {
     let scope = if allow.is_empty() { "anywhere in the repo".to_string() } else { allow.join(", ") };
     let off = if deny.is_empty() { String::new() } else { format!(" Never edit: {}.", deny.join(", ")) };
     let rules = match kind {
@@ -207,11 +260,16 @@ pub fn brief(kind: Kind, goal: &str, task: &str, allow: &[String], deny: &[Strin
         Kind::Edit => format!("Make exactly this change and nothing else. Edit only within: {scope}.{off} Do not refactor, rename, or reformat beyond it."),
         Kind::Hard => format!("Fix it with the smallest change that works. Edit only within: {scope}.{off}"),
     };
+    let shell = match provider {
+        // Codex reads code through its shell; allow read-only commands only.
+        Provider::Codex | Provider::Cursor => "You may run read-only shell commands (cat, sed -n, rg, ls) to read code; run nothing that changes files, installs, or uses the network.",
+        Provider::Claude => "Do not run shell commands.",
+    };
     format!(
         "You are a helper doing one task for another coding agent.\n\
          Overall goal: {goal}\n\
          Your task: {task}\n\
-         Rules: {rules} Do not run shell commands.\n\
+         Rules: {rules} {shell}\n\
          Answer in at most 12 short lines: what you found or changed, with path:line references. No preamble, no process narration."
     )
 }
@@ -276,8 +334,57 @@ pub fn run_claude(repo: &Path, route: &Route, kind: Kind, prompt: &str) -> Helpe
     }
 }
 
-/// Codex and Cursor adapters land once their CLIs are installed and signed
-/// in on this machine; until then routing never selects them.
+/// Run a Codex helper headless on the person's ChatGPT plan. Usage comes
+/// from `turn.completed`; there is no dollar figure for plan runs.
+pub fn run_codex(repo: &Path, route: &Route, prompt: &str) -> HelperRun {
+    let started = Instant::now();
+    let Some(bin) = Provider::Codex.path() else {
+        return HelperRun { error: Some("codex is not installed".into()), ..Default::default() };
+    };
+    let mut cmd = Command::new(bin);
+    // read-only disables Codex's shell in this build, so it could not read
+    // code at all. workspace-write is safe here: NDSTRL checks every change
+    // with git and puts back anything the task did not allow.
+    cmd.args(["exec", "--json", "--sandbox", "workspace-write", "--color", "never", "-c", "notify=[]", "-C"])
+        .arg(repo)
+        .arg(prompt);
+    if route.model != "default" {
+        cmd.args(["-m", &route.model]);
+    }
+    let out = match run_with_timeout(cmd, Duration::from_secs(600)) {
+        Ok(o) => o,
+        Err(e) => return HelperRun { error: Some(e), secs: started.elapsed().as_secs_f64(), ..Default::default() },
+    };
+    let mut summary = String::new();
+    let mut usage = Usage::default();
+    let mut error = None;
+    for line in String::from_utf8_lossy(&out).lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v["type"].as_str() {
+            Some("item.completed") if v["item"]["type"] == "agent_message" => {
+                summary = v["item"]["text"].as_str().unwrap_or("").trim().to_string();
+            }
+            Some("turn.completed") => {
+                let u = &v["usage"];
+                let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                let cached = g("cached_input_tokens");
+                usage.input += g("input_tokens").saturating_sub(cached);
+                usage.cache_read += cached;
+                usage.cache_write_5m += g("cache_write_input_tokens");
+                usage.output += g("output_tokens") + g("reasoning_output_tokens");
+                usage.responses += 1;
+            }
+            Some("turn.failed") | Some("error") => {
+                error = Some(v.get("error").or(v.get("message")).map(|e| e.to_string()).unwrap_or_else(|| "codex failed".into()));
+            }
+            _ => {}
+        }
+    }
+    HelperRun { ok: error.is_none() && !summary.is_empty(), summary, usage, usd: None, secs: started.elapsed().as_secs_f64(), error }
+}
+
+/// Cursor's agent CLI is not wired up yet; routing never selects it until
+/// `cursor-agent` is installed.
 pub fn run_other(route: &Route) -> HelperRun {
     HelperRun { error: Some(format!("{} helper runs are not wired up yet", route.provider.label())), ..Default::default() }
 }

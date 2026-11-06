@@ -872,7 +872,9 @@ impl Job {
             Ok(r) => r,
             Err(e) => return Outcome::Denied(e),
         };
-        let snap = if kind.edits() {
+        // Codex helpers read through a shell, so even a look-up could touch
+        // files; snapshot those too and put back anything they change.
+        let snap = if kind.edits() || route.provider != crate::route::Provider::Claude {
             match git::Snapshot::take(&self.repo) {
                 Some(s) => Some(s),
                 None => return Outcome::Denied("helpers may only edit inside a git repo, so NDSTRL can check and undo their changes. Do the edit yourself with `edit`.".into()),
@@ -882,11 +884,12 @@ impl Job {
         };
         let mut allow = self.spec.allow.clone();
         allow.extend(self.state.widened.iter().cloned());
-        let prompt = crate::route::brief(kind, &self.spec.goal, task, &allow, &self.spec.deny);
+        let prompt = crate::route::brief(route.provider, kind, &self.spec.goal, task, &allow, &self.spec.deny);
         self.log("delegate_start", serde_json::json!({ "kind": kind, "agent": route.provider, "model": route.model, "task": task }));
         self.persist();
         let run = match route.provider {
             crate::route::Provider::Claude => crate::route::run_claude(&self.repo, &route, kind, &prompt),
+            crate::route::Provider::Codex => crate::route::run_codex(&self.repo, &route, &prompt),
             _ => crate::route::run_other(&route),
         };
         self.state.delegated.add(&run.usage);
@@ -897,7 +900,7 @@ impl Job {
                 if c.path.starts_with(".ndstrl/") {
                     continue;
                 }
-                let verdict = self.scope.can_edit(&c.path);
+                let verdict = if kind.edits() { self.scope.can_edit(&c.path) } else { Verdict::Forbidden("look-up helpers may not change files".into()) };
                 if verdict == Verdict::Allowed {
                     let before = c.before.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
                     let after = c.after.as_deref().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
@@ -923,7 +926,11 @@ impl Job {
             reverted: reverted.clone(),
         });
         self.log("delegate", serde_json::json!({ "model": route.model, "usd": run.usd, "secs": run.secs, "ok": run.ok, "changed": changed, "reverted": reverted }));
-        let cost = run.usd.map(|u| format!("${u:.3}")).unwrap_or_else(|| "cost unknown".into());
+        let cost = match (run.usd, route.provider) {
+            (Some(u), _) => format!("${u:.3}"),
+            (None, crate::route::Provider::Codex) => format!("{} tokens on your ChatGPT plan", run.usage.tokens()),
+            _ => "cost unknown".into(),
+        };
         let mut text = format!("Helper: {} {model_short} ({}), {cost}, {:.0}s.\n", route.provider.label(), route.why, run.secs);
         match &run.error {
             Some(e) if run.summary.is_empty() => text.push_str(&format!("It failed: {e}\n")),
