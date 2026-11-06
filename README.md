@@ -33,10 +33,29 @@ Then start a new session and say what you want, with a budget:
 
 The traveler lives at `.ndstrl/job.toml` (commit it, the part travels). Live state and an event ledger sit beside it for the front office to watch.
 
+## Front office
+
+`ndstrl-desk [repo]` opens a desktop window (Dioxus, 100% Rust) that watches a repo's floor live: status, the open question, list-price spend against the cap, plan window usage, tokens, inspection (marked stale when edits landed after it), the traveler, files touched, and the activity timeline. Receipts has every run. It only reads the files the factory writes and computes gauges with the same core functions as the server, so the two cannot disagree.
+
+```bash
+cargo run --release -p ndstrl-desk -- path/to/repo
+```
+
+UI changes are checked with `desk-snapshot`, which renders the same components to static HTML from real fixture state for screenshots at desktop and phone widths, light and dark:
+
+```bash
+cargo run -p ndstrl-desk --bin desk-snapshot -- path/to/repo target/ui/floor.html --theme dark
+```
+
+## Bench
+
+`ndstrl bench` runs fixed parts in `bench/parts/` through real headless Claude Code sessions, once naked and once through the factory, and scores them: good (green and faithful to the codebase's meaning, or correctly stopped), tokens, list price, turns, files outside scope, and questions asked. Results land in `bench/results/`.
+
 ## Layout
 
 - `crates/core`: traveler, scope, reads, critic, meter, job engine
-- `crates/ndstrl`: the binary (MCP server and CLI)
+- `crates/ndstrl`: the binary (MCP server, CLI, status line, bench)
+- `crates/desk`: the front office (desktop app and snapshot renderer)
 
 ## Not promised
 

@@ -1,0 +1,23 @@
+[package]
+name = "ndstrl-desk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NDSTRL front office: watch the floor, read the receipts."
+
+[[bin]]
+name = "ndstrl-desk"
+path = "src/main.rs"
+
+[[bin]]
+name = "desk-snapshot"
+path = "src/bin/snapshot.rs"
+
+[dependencies]
+ndstrl-core = { path = "../core" }
+dioxus = { version = "0.7.10", features = ["desktop"] }
+dioxus-ssr = "0.7.10"
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio = { version = "1", features = ["time"] }

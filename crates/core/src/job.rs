@@ -79,6 +79,9 @@ pub struct State {
     /// the base for projecting plan usage between snapshots.
     #[serde(default)]
     pub plan_anchor: Option<(i64, f64)>,
+    /// Edits applied since the last inspection; nonzero means its verdict is stale.
+    #[serde(default)]
+    pub edits_since_inspect: u32,
 }
 
 /// What a tool hands back. Every variant is reported with the gauges.
@@ -121,7 +124,7 @@ impl Gauges {
         let q = self.open_question.map(|q| format!(" | waiting on question {q}")).unwrap_or_default();
         let w = |e: &Option<crate::plan::Estimate>, job: Option<f64>, name: &str| -> Option<String> {
             let e = e.as_ref()?;
-            let j = job.map(|j| format!(" (job +{j:.1})")).unwrap_or_default();
+            let j = job.filter(|j| *j >= 0.05).map(|j| format!(" (job +{j:.1})")).unwrap_or_default();
             Some(format!("{name} {:.0}%{}{j}", e.used_percentage, if e.projected { "~" } else { "" }))
         };
         let plan: Vec<String> = [w(&self.plan_5h, self.job_5h_pts, "5h"), w(&self.plan_7d, self.job_7d_pts, "7d")]
@@ -218,77 +221,12 @@ impl Job {
         }
     }
 
-    fn plan_view(&self) -> (Option<crate::plan::Estimate>, Option<crate::plan::Estimate>, Option<f64>, Option<f64>) {
-        let Some(snap) = crate::plan::latest() else { return (None, None, None, None) };
-        let rates = crate::plan::rates();
-        let since = self.state.plan_anchor.map(|(_, u)| (self.state.usage.usd - u).max(0.0)).unwrap_or(0.0);
-        let e5 = crate::plan::estimate(&snap, "five_hour", since, &rates);
-        let e7 = crate::plan::estimate(&snap, "seven_day", since, &rates);
-        let delta = |e: &Option<crate::plan::Estimate>, w: Option<crate::plan::Window>| -> Option<f64> {
-            let (e, w) = (e.as_ref()?, w?);
-            (e.resets_at == w.resets_at).then(|| (e.used_percentage - w.used_percentage).max(0.0))
-        };
-        let open = self.state.plan_at_open.as_ref();
-        let d5 = delta(&e5, open.and_then(|o| o.five_hour));
-        let d7 = delta(&e7, open.and_then(|o| o.seven_day));
-        (e5, e7, d5, d7)
-    }
-
-    fn metered(&self) -> bool {
-        self.meter.is_some() && self.state.usage.unpriced_responses == 0
-    }
-
     pub fn gauges(&self) -> Gauges {
-        let t = &self.traveler;
-        let s = &self.state;
-        let spent = self.metered().then_some(s.usage.usd);
-        let tokens = if self.meter.is_some() { s.usage.tokens() } else { s.factory_tokens };
-        let (p5, p7, d5, d7) = self.plan_view();
-        Gauges {
-            spent_usd: spent,
-            budget_usd: t.budget_usd,
-            remaining_usd: match (spent, t.budget_usd) {
-                (Some(sp), Some(b)) => Some(b - sp),
-                _ => None,
-            },
-            tokens,
-            budget_tokens: t.budget_tokens,
-            meter: if self.meter.is_some() { "transcript" } else { "factory estimate" },
-            files_touched: s.touched.len(),
-            critic: match s.critic_runs.last() {
-                None => "not run",
-                Some(r) if r.passed => "pass",
-                Some(_) => "fail",
-            },
-            done: s.done,
-            open_question: s.questions.iter().find(|q| q.answer.is_none()).map(|q| q.id),
-            plan_5h: p5,
-            plan_7d: p7,
-            job_5h_pts: d5,
-            job_7d_pts: d7,
-        }
+        gauges_of(&self.traveler, &self.state)
     }
 
-    /// Fraction of the budget left, using dollars when metered, else tokens.
-    /// Fraction of the tightest budget left: list dollars, tokens, or plan
-    /// window points, whichever is closest to its cap.
     pub fn remaining_fraction(&self) -> Option<f64> {
-        let g = self.gauges();
-        let t = &self.traveler;
-        let mut fracs = Vec::new();
-        if let (Some(r), Some(b)) = (g.remaining_usd, g.budget_usd) {
-            fracs.push(r / b);
-        }
-        if let Some(b) = g.budget_tokens {
-            fracs.push(1.0 - g.tokens as f64 / b as f64);
-        }
-        if let (Some(cap), Some(used)) = (t.budget_plan_5h_pct, g.job_5h_pts) {
-            fracs.push(1.0 - used / cap);
-        }
-        if let (Some(cap), Some(used)) = (t.budget_plan_7d_pct, g.job_7d_pts) {
-            fracs.push(1.0 - used / cap);
-        }
-        fracs.into_iter().reduce(f64::min)
+        remaining_fraction_of(&self.traveler, &self.gauges())
     }
 
     /// Run before every step that spends. Returns a block or a question
@@ -476,6 +414,7 @@ impl Job {
                 _ => {}
             }
         }
+        self.state.edits_since_inspect += 1;
         let t = self.state.touched.entry(rel.to_string()).or_default();
         t.added += add;
         t.removed += rem;
@@ -559,6 +498,7 @@ impl Job {
         };
         self.log("inspect", serde_json::json!({ "passed": passed, "secs": run.secs, "exit": run.exit_code }));
         self.state.critic_runs.push(run);
+        self.state.edits_since_inspect = 0;
         self.charge(&text);
         self.persist();
         Outcome::Ok(text)
@@ -666,4 +606,74 @@ impl Job {
     pub fn scope(&self) -> &Scope {
         &self.scope
     }
+}
+
+// ---- pure views, shared by the server and the front office -----------------
+
+fn plan_view(s: &State) -> (Option<crate::plan::Estimate>, Option<crate::plan::Estimate>, Option<f64>, Option<f64>) {
+    let Some(snap) = crate::plan::latest() else { return (None, None, None, None) };
+    let rates = crate::plan::rates();
+    let since = s.plan_anchor.map(|(_, u)| (s.usage.usd - u).max(0.0)).unwrap_or(0.0);
+    let e5 = crate::plan::estimate(&snap, "five_hour", since, &rates);
+    let e7 = crate::plan::estimate(&snap, "seven_day", since, &rates);
+    let delta = |e: &Option<crate::plan::Estimate>, w: Option<crate::plan::Window>| -> Option<f64> {
+        let (e, w) = (e.as_ref()?, w?);
+        (e.resets_at == w.resets_at).then(|| (e.used_percentage - w.used_percentage).max(0.0))
+    };
+    let open = s.plan_at_open.as_ref();
+    let d5 = delta(&e5, open.and_then(|o| o.five_hour));
+    let d7 = delta(&e7, open.and_then(|o| o.seven_day));
+    (e5, e7, d5, d7)
+}
+
+/// Gauges from the traveler and saved state alone. The server and the
+/// front office both call this, so they can never disagree.
+pub fn gauges_of(t: &Traveler, s: &State) -> Gauges {
+    let has_meter = s.transcript.is_some();
+    let spent = (has_meter && s.usage.unpriced_responses == 0).then_some(s.usage.usd);
+    let tokens = if has_meter { s.usage.tokens() } else { s.factory_tokens };
+    let (p5, p7, d5, d7) = plan_view(s);
+    Gauges {
+        spent_usd: spent,
+        budget_usd: t.budget_usd,
+        remaining_usd: match (spent, t.budget_usd) {
+            (Some(sp), Some(b)) => Some(b - sp),
+            _ => None,
+        },
+        tokens,
+        budget_tokens: t.budget_tokens,
+        meter: if has_meter { "transcript" } else { "factory estimate" },
+        files_touched: s.touched.len(),
+        critic: match s.critic_runs.last() {
+            None => "not run",
+            Some(_) if s.edits_since_inspect > 0 && !s.done => "stale",
+            Some(r) if r.passed => "pass",
+            Some(_) => "fail",
+        },
+        done: s.done,
+        open_question: s.questions.iter().find(|q| q.answer.is_none()).map(|q| q.id),
+        plan_5h: p5,
+        plan_7d: p7,
+        job_5h_pts: d5,
+        job_7d_pts: d7,
+    }
+}
+
+/// Fraction of the tightest budget left: list dollars, tokens, or plan
+/// window points, whichever is closest to its cap.
+pub fn remaining_fraction_of(t: &Traveler, g: &Gauges) -> Option<f64> {
+    let mut fracs = Vec::new();
+    if let (Some(r), Some(b)) = (g.remaining_usd, g.budget_usd) {
+        fracs.push(r / b);
+    }
+    if let Some(b) = g.budget_tokens {
+        fracs.push(1.0 - g.tokens as f64 / b as f64);
+    }
+    if let (Some(cap), Some(used)) = (t.budget_plan_5h_pct, g.job_5h_pts) {
+        fracs.push(1.0 - used / cap);
+    }
+    if let (Some(cap), Some(used)) = (t.budget_plan_7d_pct, g.job_7d_pts) {
+        fracs.push(1.0 - used / cap);
+    }
+    fracs.into_iter().reduce(f64::min)
 }
